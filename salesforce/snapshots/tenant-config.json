@@ -1,0 +1,23 @@
+{
+    "hotglue_mapping": {
+        "mapping": {
+            "AJ3x0LMYI": {
+                "accounts/Account": {
+                    "name": "Name",
+                    "domain": "Website",
+                    "summary": "Description"
+                },
+                "contacts/Contact": {
+                    "firstName": "FirstName",
+                    "lastName": "LastName",
+                    "email": "Email",
+                    "accountId": "AccountId"
+                }
+            }
+        },
+        "source_data": null
+    },
+    "customTriggers": {
+        "salesforce": []
+    }
+}

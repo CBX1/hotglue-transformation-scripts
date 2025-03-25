@@ -1,0 +1,2 @@
+gluestick==2.2.10
+pandas>=1.3.5
