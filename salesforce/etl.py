@@ -11,6 +11,7 @@ import os
 import json
 import numpy as np
 import ast
+from utils import map_stream_data, drop_sent_records, split_contacts_by_account, get_contact_data
 
 
 # Let's establish the standard hotglue input/output directories
@@ -36,6 +37,19 @@ if config:
     # Get the mapping information if exists
     mapping = config.get("hotglue_mapping")
     mapping = mapping.get("mapping")
+
+
+# get tap config
+config_path = f"{ROOT_DIR}/config.json"
+
+tap_config= None
+# Verifies if `tenant-config.json` exists
+if os.path.exists(config_path):
+    with open(config_path) as f:
+        tap_config = json.load(f)
+else:
+    print("No tap config found")
+    tap_config = {}
 
 # reading data from sync-output folder
 input = gs.Reader(INPUT_DIR)
@@ -74,52 +88,26 @@ if job_type == "write":
 
         for stream in streams:
             if new_mapping.get(stream):
-                stream_mapping = new_mapping.get(stream)
-                connector_columns = list(stream_mapping.keys())
-                stream_data = input.get(stream)
+                sent_data = gs.read_snapshots(
+                    f"{stream_name_mapping[stream]}_{flow_id}", SNAPSHOT_DIR
+                )
 
-                if not new_mapping.get(stream).get("remote_id"):
-                    new_mapping[stream]["remote_id"] = "Id"
-
-                target_api_columns = list(new_mapping.get(stream).keys())
-                connector_columns = list(new_mapping.get(stream).values())
-
-                columns_to_rename = [
-                    column
-                    for column in stream_data.columns
-                    if column in target_api_columns
-                ]
-                for column in columns_to_rename:
-                    try:
-                        stream_data[
-                            connector_columns[target_api_columns.index(column)]
-                        ] = stream_data[column]
-                    except:
-                        print("Error renaming columns")
-
-                stream_columns = [
-                    col for col in connector_columns if col in stream_data.columns
-                ]
-
-                # Map id => external_id
-                if "id" in stream_data.columns:
-                    stream_columns = stream_columns + ["externalId"]
-                    stream_data["externalId"] = stream_data["id"]
-
-                stream_data = stream_data[list(set(stream_columns))]
-
-                if stream == "contacts":
-                    # determine which contacts have been updated since last job
-                    new_contacts = stream_data.copy()
-                    # get all contacts
-                    contacts_snap = gs.snapshot_records(
-                        stream_data, "contacts", SNAPSHOT_DIR, pk="externalId"
+                if stream != "contacts":
+                    # map the data
+                    stream_data = input.get(stream)
+                    stream_columns, stream_data = map_stream_data(stream_data, stream, new_mapping)
+                    # we only want the data that we have not been sent before
+                    stream_data = drop_sent_records(stream, stream_data, sent_data)
+                    # output the data
+                    gs.to_singer(
+                        stream_data,
+                        stream_name_mapping[stream],
+                        OUTPUT_DIR,
+                        allow_objects=True,
                     )
-                    # we do not want the hash from the snapshot if it's there
-                    if "hash" in contacts_snap.columns:
-                        contacts_snap = contacts_snap.drop(columns=["hash"])
 
-                    # filter: have a valid account id in the snapshot
+                else:
+                    # 1. get all accounts / filter: have a valid account id in the snapshot
                     sent_accounts = gs.read_snapshots(
                         f"{stream_name_mapping['accounts']}_{flow_id}", SNAPSHOT_DIR
                     )
@@ -128,52 +116,66 @@ if job_type == "write":
                         continue
 
                     sent_accounts = sent_accounts.rename(columns={"InputId": "AccountId", "RemoteId": "RemoteAccountId"})
-                    # doing an inner join intentionally here
-                    contacts_snap = contacts_snap.merge(
-                        sent_accounts, on="AccountId" 
-                    ).rename(columns={"AccountId": "InputAccountId", "RemoteAccountId": "AccountId"})
+                    # clean accounts without RemoteAccountId
+                    sent_accounts = sent_accounts[sent_accounts["RemoteAccountId"].notna()]
+                    
+                    contacts = input.get(stream)
+                    leads = None
+                    # if dynamic flag is on we need to divide contacts into two streams: contacts and leads
+                    if connector_id == "salesforce" and tap_config.get("dynamic_contact_mapping"):
+                        contacts, leads = split_contacts_by_account(contacts, sent_accounts)
 
-                    # if this is hubspot we need to inject an turn our AccountId column into an associations array
-                    if connector_id == "hubspot":
-                        contacts_snap["AccountId"] = contacts_snap["AccountId"].apply(
-                            lambda x: [
-                                {
-                                    "to": {"id": x},
-                                    "types": [
-                                        {
-                                            "associationCategory": "HUBSPOT_DEFINED",
-                                            "associationTypeId": 279,
-                                        }
-                                    ],
-                                }
-                            ]
+                    for _stream in ["Contact", "Lead"]:
+                        stream_data = get_contact_data(connector_id, _stream, contacts, leads)
+                        if stream_data is None or stream_data.empty:
+                            continue
+
+                        mapping_name = "contacts" if connector_id == "hubspot" else {v: k for k, v in stream_name_mapping.items()}.get(_stream)
+
+                        stream_columns, stream_data = map_stream_data(stream_data, mapping_name, new_mapping)
+                        new_data = stream_data.copy()
+                        # get all contacts
+                        data_snap = gs.snapshot_records(
+                            stream_data, mapping_name, SNAPSHOT_DIR, pk="externalId"
                         )
-                        contacts_snap = contacts_snap.rename(columns={"AccountId": "associations"})
-                        stream_columns.remove("AccountId")
-                        stream_columns.append("associations")
+                        # we do not want the hash from the snapshot if it's there
+                        if "hash" in data_snap.columns:
+                            data_snap = data_snap.drop(columns=["hash"])
+                        
+                        if _stream != "Lead":
+                            data_snap = data_snap.merge(
+                                sent_accounts, on="AccountId" 
+                            ).rename(columns={"AccountId": "InputAccountId", "RemoteAccountId": "AccountId"})
+                        
+                        if connector_id == "hubspot":
+                            data_snap["AccountId"] = data_snap["AccountId"].apply(
+                                lambda x: [
+                                    {
+                                        "to": {"id": x},
+                                        "types": [
+                                            {
+                                                "associationCategory": "HUBSPOT_DEFINED",
+                                                "associationTypeId": 279,
+                                            }
+                                        ],
+                                    }
+                                ]
+                            )
+                            data_snap = data_snap.rename(columns={"AccountId": "associations"})
+                            stream_columns.remove("AccountId")
+                            stream_columns.append("associations")
+                        
+                        # We can now use this as the final output data
+                        stream_data = data_snap[list(set(stream_columns))]
+                        # drop sent records
+                        stream_data = drop_sent_records(stream, stream_data, sent_data, new_data)
 
-                    # We can now use this as the final output data
-                    stream_data = contacts_snap[list(set(stream_columns))]
-
-                # we only want the data that we have not been sent before
-                sent_data = gs.read_snapshots(
-                    f"{stream_name_mapping[stream]}_{flow_id}", SNAPSHOT_DIR
-                )
-                if sent_data is not None:
-                    condition = ~stream_data["externalId"].isin(sent_data["InputId"])
-
-                    # We want to send contacts that have not been sent before OR have any updates
-                    if stream == "contacts":
-                        condition = condition | (stream_data["externalId"].isin(new_contacts["externalId"]))
-
-                    stream_data = stream_data[condition]
-
-                gs.to_singer(
-                    stream_data,
-                    stream_name_mapping[stream],
-                    OUTPUT_DIR,
-                    allow_objects=True,
-                )
+                        gs.to_singer(
+                            stream_data,
+                            stream_name_mapping[mapping_name],
+                            OUTPUT_DIR,
+                            allow_objects=True,
+                        )
             else:
                 stream_data = input.get(stream)
                 gs.to_singer(
