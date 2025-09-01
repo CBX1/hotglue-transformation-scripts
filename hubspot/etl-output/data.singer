@@ -1,0 +1,3 @@
+{"type": "SCHEMA", "stream": "companies", "schema": {"type": ["object", "null"], "properties": {"id": {"type": ["string", "null"]}, "updatedAt": {"format": "date-time", "type": ["string", "null"]}, "domain": {"type": ["string", "null"]}, "name": {"type": ["string", "null"]}, "externalIdSource": {"type": ["string", "null"]}}}, "key_properties": []}
+{"type": "RECORD", "stream": "companies", "record": {"id": "144195551961", "updatedAt": "2025-09-01T06:10:37.867000Z", "domain": "hubspot.com", "name": "HubSpot", "externalIdSource": "hubspot"}}
+{"type": "STATE", "value": {}}

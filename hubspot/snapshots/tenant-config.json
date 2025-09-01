@@ -1,0 +1,38 @@
+{
+    "hotglue_metadata":
+    {
+        "metadata":
+        {
+            "Name": "Hotglue - HubSpot",
+            "OrgId": "f71fd28f-74db-40cb-8abf-07f5eb329fc2"
+        }
+    },
+    "hotglue_mapping":
+    {
+        "mapping":
+        {
+            "AJ3x0LMYI":
+            {
+                "accounts/Account":
+                {
+                    "name": "Name",
+                    "domain": "Website",
+                    "summary": "Description"
+                },
+                "contacts/Contact":
+                {
+                    "firstName": "FirstName",
+                    "lastName": "LastName",
+                    "email": "Email",
+                    "accountId": "AccountId"
+                }
+            }
+        },
+        "source_data": null
+    },
+    "customTriggers":
+    {
+        "salesforce":
+        []
+    }
+}
