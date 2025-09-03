@@ -11,7 +11,12 @@ import os
 import json
 import numpy as np
 import ast
+import logging
 from utils import map_stream_data, drop_sent_records, split_contacts_by_account, get_contact_data
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 
 # Let's establish the standard hotglue input/output directories
@@ -43,12 +48,12 @@ if config:
 config_path = f"{ROOT_DIR}/config.json"
 
 tap_config= None
-# Verifies if `tenant-config.json` exists
+# Verifies if `config.json` exists
 if os.path.exists(config_path):
     with open(config_path) as f:
         tap_config = json.load(f)
 else:
-    print("No tap config found")
+    logger.info("No tap config found")
     tap_config = {}
 
 # reading data from sync-output folder
@@ -56,7 +61,7 @@ input = gs.Reader(INPUT_DIR)
 
 job_type = os.environ.get("JOB_TYPE", "write")
 flow_id = os.environ.get("FLOW", "AJ3x0LMYI")
-print(f"Running job: {job_type}")
+logger.info(f"Running job: {job_type}")
 
 s3_root = os.environ.get("JOB_ROOT")
 connector_id = os.environ.get("CONNECTOR_ID", "salesforce")
@@ -78,13 +83,8 @@ if job_type == "write":
             new_stream = stream.split("/")[0]
             new_mapping[new_stream] = mapping.get(stream)
 
-    if mapping is not None:
         streams = eval(str(input))
         streams.sort()
-        new_mapping = {}
-        for stream in mapping.keys():
-            new_stream = stream.split("/")[0]
-            new_mapping[new_stream] = mapping.get(stream)
 
         for stream in streams:
             if new_mapping.get(stream):
@@ -112,7 +112,7 @@ if job_type == "write":
                         f"{stream_name_mapping['accounts']}_{flow_id}", SNAPSHOT_DIR
                     )
                     if sent_accounts is None:
-                        print("No accounts have been sent yet, skipping contacts export.")
+                        logger.info("No accounts have been sent yet, skipping contacts export.")
                         continue
 
                     sent_accounts = sent_accounts.rename(columns={"InputId": "AccountId", "RemoteId": "RemoteAccountId"})
