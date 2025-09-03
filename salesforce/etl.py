@@ -243,12 +243,19 @@ else:
                     })
 
                     stream_data = stream_data.merge(sent_data, how="left", on="remote_id")
-
-            # Inject the connector_id as externalIdSource
-            stream_data["externalIdSource"] = connector_id
-            # CBX1 expects the remote_id to be called externalId
+            
+            # Inject the CRM system enum expected by CBX1 (SALESFORCE/HUBSPOT)
+            crm_system = connector_id.upper() if connector_id else ""
+            if crm_system not in ["SALESFORCE", "HUBSPOT"]:
+                # Fallback mapping for known ids
+                if str(connector_id).lower() == "salesforce":
+                    crm_system = "SALESFORCE"
+                elif str(connector_id).lower() == "hubspot":
+                    crm_system = "HUBSPOT"
+            stream_data["crmSystem"] = crm_system
+            # CBX1 expects the remote_id to be called crmAssociationId
             stream_data = stream_data.rename(columns={
-                "remote_id": "externalId"
+                "remote_id": "crmAssociationId"
             })
 
             stream_name = output_stream or stream
