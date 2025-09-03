@@ -1,1 +1,29 @@
-{"hotglue_metadata": {"metadata": {"Name": "Salesforce", "OrgId": "f8738a65-79f5-493c-a088-c9eda2d520ed"}}, "hotglue_mapping": {"mapping": {"AJ3x0LMYI": {"accounts/Account": {"name": "Name", "domain": "Website", "summary": "Description"}, "contacts/Contact": {"firstName": "FirstName", "lastName": "LastName", "email": "Email", "accountId": "AccountId"}}}, "source_data": null}, "customTriggers": {"salesforce": []}}
+{
+    "hotglue_metadata": {
+      "metadata": {
+        "Name": "Salesforce",
+        "OrgId": "f8738a65-79f5-493c-a088-c9eda2d520ed"
+      }
+    },
+    "hotglue_mapping": {
+      "mapping": {
+        "AJ3x0LMYI": {
+          "accounts/Account": {
+            "name": "Name",
+            "domain": "Website",
+            "summary": "Description"
+          },
+          "contacts/Contact": {
+            "firstName": "FirstName",
+            "lastName": "LastName",
+            "email": "Email",
+            "accountId": "AccountId"
+          }
+        }
+      },
+      "source_data": null
+    },
+    "customTriggers": {
+      "salesforce": []
+    }
+  }

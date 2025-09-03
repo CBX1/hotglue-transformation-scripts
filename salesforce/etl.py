@@ -243,6 +243,33 @@ else:
                     })
 
                     stream_data = stream_data.merge(sent_data, how="left", on="remote_id")
+                
+                # Handle accountId mapping for contacts - replace Salesforce AccountId with CBX1 account ID
+                if output_stream == "contacts" and "accountId" in stream_data.columns:
+                    # Get account snapshots to map Salesforce account IDs to CBX1 account IDs
+                    account_snapshots = gs.read_snapshots(
+                        f"Account_{flow_id}", SNAPSHOT_DIR
+                    )
+                    
+                    if account_snapshots is not None:
+                        account_snapshots = account_snapshots.rename(columns={
+                            "InputId": "cbx1_account_id",
+                            "RemoteId": "salesforce_account_id"
+                        })
+                        
+                        # Merge to get CBX1 account IDs
+                        stream_data = stream_data.merge(
+                            account_snapshots[["salesforce_account_id", "cbx1_account_id"]], 
+                            left_on="accountId", 
+                            right_on="salesforce_account_id", 
+                            how="left"
+                        )
+                        
+                        # Replace accountId with CBX1 account ID where available
+                        stream_data["accountId"] = stream_data["cbx1_account_id"].fillna(stream_data["accountId"])
+                        
+                        # Clean up temporary columns
+                        stream_data = stream_data.drop(columns=["salesforce_account_id", "cbx1_account_id"], errors="ignore")
             
             # Inject the CRM system enum expected by CBX1 (SALESFORCE/HUBSPOT)
             crm_system = connector_id.upper() if connector_id else ""
