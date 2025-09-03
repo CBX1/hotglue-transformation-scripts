@@ -1,17 +1,19 @@
+import pandas as pd
+from typing import Tuple, Optional
 
 
-def map_stream_data(stream_data, stream, mapping):
+def map_stream_data(stream_data: pd.DataFrame, stream: str, mapping: dict) -> Tuple[list, pd.DataFrame]:
     """
     Maps data from source format to target format based on provided mapping configuration.
     
     Args:
-        stream_data (pd.DataFrame): DataFrame containing the source data
-        stream (str): Name of the data stream being processed
-        mapping (dict): Mapping configuration that defines field mappings between source and target
+        stream_data: DataFrame containing the source data
+        stream: Name of the data stream being processed
+        mapping: Mapping configuration that defines field mappings between source and target
         
     Returns:
-        tuple: (stream_columns, stream_data) where stream_columns is list of mapped column names 
-        and stream_data is the transformed DataFrame
+        (stream_columns, stream_data) where stream_columns is list of mapped column names
+        and stream_data is the transformed DataFrame.
     
     Raises:
         ValueError: If mapping configuration is missing or invalid
@@ -23,11 +25,10 @@ def map_stream_data(stream_data, stream, mapping):
     if stream not in mapping:
         raise ValueError(f"No mapping found for stream: {stream}")
     
-    stream_mapping = mapping.get(stream)
+    stream_mapping = dict(mapping.get(stream))  # shallow copy to avoid side-effects
     
-    # Ensure remote_id is set in mapping
-    if "remote_id" not in stream_mapping:
-        stream_mapping["remote_id"] = "Id"
+    # Ensure remote_id is set in mapping (do not mutate caller's dict)
+    stream_mapping.setdefault("remote_id", "Id")
 
     target_api_columns = list(stream_mapping.keys())
     connector_columns = list(stream_mapping.values())
@@ -66,7 +67,12 @@ def map_stream_data(stream_data, stream, mapping):
     return unique_columns, stream_data
 
 
-def drop_sent_records(stream, stream_data, sent_data, new_data=None):
+def drop_sent_records(
+    stream: str,
+    stream_data: pd.DataFrame,
+    sent_data: Optional[pd.DataFrame],
+    new_data: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
     """
     Filters out records that have already been sent to avoid duplicates.
     
@@ -77,7 +83,7 @@ def drop_sent_records(stream, stream_data, sent_data, new_data=None):
         new_data (pd.DataFrame, optional): DataFrame containing new/updated records
         
     Returns:
-        pd.DataFrame: Filtered DataFrame containing only unsent/updated records
+        Filtered DataFrame containing only unsent/updated records
     """
     # If no sent data, return all stream data
     if sent_data is None:
@@ -101,7 +107,7 @@ def drop_sent_records(stream, stream_data, sent_data, new_data=None):
     return stream_data[condition]
 
 
-def split_contacts_by_account(contacts, sent_accounts):
+def split_contacts_by_account(contacts: pd.DataFrame, sent_accounts: pd.DataFrame):
     """
     Splits contact records into contacts and leads based on account association.
     
@@ -110,7 +116,7 @@ def split_contacts_by_account(contacts, sent_accounts):
         sent_accounts (pd.DataFrame): DataFrame containing account records that have been sent
         
     Returns:
-        tuple: (contacts_df, leads_df) where contacts_df contains records with existing accounts 
+        (contacts_df, leads_df) where contacts_df contains records with existing accounts
         and leads_df contains records with missing accounts
     
     Raises:
@@ -143,7 +149,12 @@ def split_contacts_by_account(contacts, sent_accounts):
     
     return contacts_df, leads_df
 
-def get_contact_data(connector_id, stream, contacts, leads):
+def get_contact_data(
+    connector_id: str,
+    stream: str,
+    contacts: Optional[pd.DataFrame],
+    leads: Optional[pd.DataFrame],
+) -> pd.DataFrame:
     """
     Gets the appropriate contact data based on connector ID and stream type.
     
