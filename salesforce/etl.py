@@ -296,17 +296,25 @@ def _handle_read_job(
             if output_stream == "contacts" and "accountId" in stream_data.columns:
                 account_snapshots = gs.read_snapshots(f"Account_{flow_id}", SNAPSHOT_DIR)
                 if account_snapshots is not None:
-                    account_snapshots = account_snapshots.rename(
+                    acc = account_snapshots.rename(
                         columns={"InputId": "cbx1_account_id", "RemoteId": "salesforce_account_id"}
-                    )
+                    ).copy()
+                    # Normalize identifiers as strings
+                    stream_data["accountId"] = stream_data["accountId"].astype(str)
+                    acc["salesforce_account_id"] = acc["salesforce_account_id"].astype(str)
+                    # Only exact match (do not fallback to SF id)
                     stream_data = stream_data.merge(
-                        account_snapshots[["salesforce_account_id", "cbx1_account_id"]],
+                        acc[["salesforce_account_id", "cbx1_account_id"]],
                         left_on="accountId",
                         right_on="salesforce_account_id",
                         how="left",
                     )
-                    stream_data["accountId"] = stream_data["cbx1_account_id"].fillna(stream_data["accountId"])
-                    stream_data = stream_data.drop(columns=["salesforce_account_id", "cbx1_account_id"], errors="ignore")
+                    # Set accountId strictly to CBX1 id; leave null if no match
+                    stream_data["accountId"] = stream_data["cbx1_account_id"]
+                    stream_data = stream_data.drop(
+                        columns=["salesforce_account_id", "cbx1_account_id"],
+                        errors="ignore",
+                    )
 
         # Inject CRM system + rename remote_id -> crmAssociationId
         stream_data = _inject_crm_system(stream_data, connector_id)
@@ -335,4 +343,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
