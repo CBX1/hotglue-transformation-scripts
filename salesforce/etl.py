@@ -38,7 +38,7 @@ def _load_json(path: str) -> Optional[dict]:
         return json.load(f)
 
 
-def _load_tenant_mapping(flow_id: str) -> Tuple[Optional[Dict], Optional[Dict]]:
+def _load_tenant_mapping(flow_id: str, connector_id: str) -> Tuple[Optional[Dict], Optional[Dict]]:
     """
     Returns (mapping_for_flow, stream_name_mapping) or (None, None)
     mapping_for_flow is keyed by "target_api/connector" for each stream.
@@ -49,7 +49,11 @@ def _load_tenant_mapping(flow_id: str) -> Tuple[Optional[Dict], Optional[Dict]]:
         return None, None
 
     mapping_root = tenant_cfg.get("hotglue_mapping", {}).get("mapping", {})
-    mapping_for_flow = mapping_root.get(flow_id)
+    flow_mapping = mapping_root.get(flow_id)
+    if not flow_mapping:
+        return None, None
+
+    mapping_for_flow = flow_mapping.get(connector_id)
     if not mapping_for_flow:
         return None, None
 
@@ -332,7 +336,7 @@ def main() -> None:
     connector_id = os.environ.get("CONNECTOR_ID", "salesforce")
     logger.info(f"Running job: {job_type}")
 
-    mapping_for_flow, stream_name_mapping = _load_tenant_mapping(flow_id)
+    mapping_for_flow, stream_name_mapping = _load_tenant_mapping(flow_id, connector_id)
     tap_config = _load_tap_config()
 
     if job_type == "write":
