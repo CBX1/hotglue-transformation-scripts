@@ -38,7 +38,7 @@ def _load_json(path: str) -> Optional[dict]:
         return json.load(f)
 
 
-def _load_tenant_mapping(flow_id: str, connector_id: str) -> Tuple[Optional[Dict], Optional[Dict]]:
+def _load_tenant_mapping(flow_id: str) -> Tuple[Optional[Dict], Optional[Dict]]:
     """
     Returns (mapping_for_flow, stream_name_mapping) or (None, None)
     mapping_for_flow is keyed by "target_api/connector" for each stream.
@@ -49,11 +49,7 @@ def _load_tenant_mapping(flow_id: str, connector_id: str) -> Tuple[Optional[Dict
         return None, None
 
     mapping_root = tenant_cfg.get("hotglue_mapping", {}).get("mapping", {})
-    flow_mapping = mapping_root.get(flow_id)
-    if not flow_mapping:
-        return None, None
-
-    mapping_for_flow = flow_mapping.get(connector_id)
+    mapping_for_flow = mapping_root.get(flow_id)
     if not mapping_for_flow:
         return None, None
 
@@ -284,7 +280,9 @@ def _handle_read_job(
                 for ind in np.where(gc == column)[0]:
                     stream_data[connector_columns[ind]] = stream_data[column]
 
-            cols = [c for c in connector_columns if c in stream_data.columns] + ["remote_id"]
+            cols = [c for c in connector_columns if c in stream_data.columns]
+            if "remote_id" in stream_data.columns:
+                cols.append("remote_id")
             stream_data = stream_data[list(set(cols))]
 
             # Determine output (target) stream name
@@ -333,10 +331,10 @@ def main() -> None:
 
     job_type = os.environ.get("JOB_TYPE", "write")
     flow_id = os.environ.get("FLOW", "AJ3x0LMYI")
-    connector_id = os.environ.get("CONNECTOR_ID", "salesforce")
+    connector_id = os.environ.get("CONNECTOR_ID")
     logger.info(f"Running job: {job_type}")
 
-    mapping_for_flow, stream_name_mapping = _load_tenant_mapping(flow_id, connector_id)
+    mapping_for_flow, stream_name_mapping = _load_tenant_mapping(flow_id)
     tap_config = _load_tap_config()
 
     if job_type == "write":
