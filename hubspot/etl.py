@@ -290,7 +290,7 @@ def _handle_read_job(
 
             # Inject CBX1 id when available
             sent_data = gs.read_snapshots(f"{stream}_{flow_id}", SNAPSHOT_DIR)
-            if sent_data is not None:
+            if sent_data is not None and "remote_id" in stream_data.columns:
                 sent_data = sent_data.rename(columns={"InputId": "id", "RemoteId": "remote_id"})
                 stream_data = stream_data.merge(sent_data, how="left", on="remote_id")
 
