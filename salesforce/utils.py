@@ -1,5 +1,24 @@
 import pandas as pd
 from typing import Tuple, Optional
+import gluestick as gs
+
+
+def get_stream_data(reader: gs.Reader, stream: str, catalog_types: bool = True):
+    """
+    Wrapper function to get stream data with catalog_types=True by default.
+    
+    This ensures consistent behavior across all reader.get() calls without
+    requiring developers to remember to pass catalog_types=True.
+    
+    Args:
+        reader: The gluestick Reader instance
+        stream: Name of the stream to read
+        catalog_types: Whether to use catalog types (defaults to True)
+        
+    Returns:
+        DataFrame with the stream data
+    """
+    return reader.get(stream, catalog_types=catalog_types)
 
 
 def map_stream_data(stream_data: pd.DataFrame, stream: str, mapping: dict) -> Tuple[list, pd.DataFrame]:

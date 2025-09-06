@@ -14,6 +14,7 @@ import pandas as pd
 from utils import (
     drop_sent_records,
     get_contact_data,
+    get_stream_data,
     map_stream_data,
     split_contacts_by_account,
 )
@@ -28,7 +29,7 @@ logger = logging.getLogger(__name__)
 ROOT_DIR = os.environ.get("ROOT_DIR", ".")
 INPUT_DIR = f"{ROOT_DIR}/sync-output"
 SNAPSHOT_DIR = f"{ROOT_DIR}/snapshots"
-OUTPUT_DIR = f"{ROOT_DIR}/etl-output"
+OUTPUT_DIR = f"{ROOT_DIR}/output"
 
 
 def _load_json(path: str) -> Optional[dict]:
@@ -95,7 +96,7 @@ def _handle_standard_write_stream(
     sent_data = gs.read_snapshots(f"{stream_name_mapping[stream]}_{flow_id}", SNAPSHOT_DIR)
 
     # Map and filter
-    stream_data = reader.get(stream)
+    stream_data = get_stream_data(reader, stream)
     stream_columns, stream_data = map_stream_data(stream_data, stream, new_mapping)
     stream_data = drop_sent_records(stream, stream_data, sent_data)
 
@@ -134,7 +135,7 @@ def _handle_contacts_write_stream(
     # Keep only accounts with a valid remote id
     sent_accounts = sent_accounts[sent_accounts["RemoteAccountId"].notna()]
 
-    contacts_df = reader.get("contacts")
+    contacts_df = get_stream_data(reader, "contacts")
     leads_df = None
 
     # Optionally split into Contact/Lead for Salesforce
@@ -217,7 +218,7 @@ def _handle_write_job(
     for stream in streams:
         if not new_mapping.get(stream):
             # Pass-through streams without mapping
-            df = reader.get(stream)
+            df = get_stream_data(reader, stream)
             gs.to_singer(df, stream_name_mapping.get(stream, stream), OUTPUT_DIR, allow_objects=True)
             continue
 
@@ -266,7 +267,7 @@ def _handle_read_job(
     new_mapping = _build_read_mapping(mapping_for_flow)
 
     for stream in data_streams:
-        stream_data = reader.get(stream)
+        stream_data = get_stream_data(reader, stream)
         output_stream = None
 
         if new_mapping.get(stream):
