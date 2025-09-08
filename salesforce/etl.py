@@ -60,8 +60,8 @@ def _load_tenant_mapping(flow_id: str) -> Tuple[Optional[Dict], Optional[Dict]]:
     return mapping_for_flow, stream_name_mapping
 
 
-def _load_tap_config() -> Dict:
-    cfg = _load_json(f"{ROOT_DIR}/config.json")
+def _load_target_config() -> Dict:
+    cfg = _load_json(f"{ROOT_DIR}/target-config.json")
     if not cfg:
         logger.info("No tap config found")
         return {}
@@ -336,7 +336,7 @@ def main() -> None:
     logger.info(f"Running job: {job_type}")
 
     mapping_for_flow, stream_name_mapping = _load_tenant_mapping(flow_id)
-    tap_config = _load_tap_config()
+    tap_config = _load_target_config()
 
     if job_type == "write":
         _handle_write_job(reader, mapping_for_flow or {}, stream_name_mapping or {}, flow_id, connector_id, tap_config)
