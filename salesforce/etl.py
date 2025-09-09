@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 ROOT_DIR = os.environ.get("ROOT_DIR", ".")
 INPUT_DIR = f"{ROOT_DIR}/sync-output"
 SNAPSHOT_DIR = f"{ROOT_DIR}/snapshots"
-OUTPUT_DIR = f"{ROOT_DIR}/output"
+OUTPUT_DIR = f"{ROOT_DIR}/etl-output"
 
 
 def _load_json(path: str) -> Optional[dict]:
