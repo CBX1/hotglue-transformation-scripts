@@ -11,13 +11,7 @@ import gluestick as gs
 import numpy as np
 import pandas as pd
 
-from utils import (
-    drop_sent_records,
-    get_contact_data,
-    get_stream_data,
-    map_stream_data,
-    split_contacts_by_account,
-)
+from utils import get_stream_data, map_stream_data, drop_sent_records, transform_dot_notation_to_nested, get_contact_data, split_contacts_by_account
 
 
 # Configure logging
@@ -243,14 +237,16 @@ def _build_read_mapping(mapping_for_flow: Dict) -> Dict:
 
 
 def _inject_crm_system(df: pd.DataFrame, connector_id: str) -> pd.DataFrame:
-    crm_system = (connector_id or "").upper()
-    if crm_system not in ["SALESFORCE", "HUBSPOT"]:
+    crm_system = "UNKNOWN"
+    if connector_id:
         if str(connector_id).lower() == "salesforce":
             crm_system = "SALESFORCE"
         elif str(connector_id).lower() == "hubspot":
             crm_system = "HUBSPOT"
     df["crmSystem"] = crm_system
     return df
+
+
 
 
 def _handle_read_job(
@@ -322,6 +318,9 @@ def _handle_read_job(
         # Inject CRM system + rename remote_id -> crmAssociationId
         stream_data = _inject_crm_system(stream_data, connector_id)
         stream_data = stream_data.rename(columns={"remote_id": "crmAssociationId"})
+
+        # Transform dot-notation fields to nested objects
+        stream_data = transform_dot_notation_to_nested(stream_data)
 
         stream_name = output_stream or stream
         gs.to_singer(stream_data, stream_name, OUTPUT_DIR, allow_objects=True)
