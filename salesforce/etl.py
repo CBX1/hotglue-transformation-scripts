@@ -207,10 +207,10 @@ def _handle_write_job(
     stream_name_mapping: Dict,
     flow_id: str,
     connector_id: str,
-    tap_config: Dict,
+    target_config: Dict,
 ) -> None:
     if not mapping_for_flow:
-        return
+        raise Exception("No write mapping found for flow")
 
     new_mapping = _build_write_mapping(mapping_for_flow)
     streams = _list_streams(reader)
@@ -336,10 +336,10 @@ def main() -> None:
     logger.info(f"Running job: {job_type}")
 
     mapping_for_flow, stream_name_mapping = _load_tenant_mapping(flow_id)
-    tap_config = _load_target_config()
+    target_config = _load_target_config()
 
     if job_type == "write":
-        _handle_write_job(reader, mapping_for_flow or {}, stream_name_mapping or {}, flow_id, connector_id, tap_config)
+        _handle_write_job(reader, mapping_for_flow or {}, stream_name_mapping or {}, flow_id, connector_id, target_config)
     else:
         _handle_read_job(reader, mapping_for_flow or {}, stream_name_mapping or {}, flow_id, connector_id)
 
