@@ -182,6 +182,7 @@ class HubSpotHandler(BaseETLHandler):
         2. Enriches with owner information when available
         3. Transforms to standardized data warehouse format
         4. Adds CBX1 IDs where available
+        5. For contacts, adds accountId by mapping associatedcompanyid -> CBX1 company id
         """
         logger.info("Starting HubSpot read operation")
         
@@ -285,7 +286,11 @@ class HubSpotHandler(BaseETLHandler):
         # Enrich with owner information for contacts and companies
         if stream in {"contacts", "companies"}:
             stream_data = self._merge_owner_details(stream_data, owner_lookup, owner_column)
-        
+
+        # For contacts: post-process to attach accountId and drop helper columns
+        if stream == "contacts":
+            stream_data = self._post_process_contacts(stream_data)
+
         # Add CRM system identifier
         stream_data = self._add_crm_system(stream_data)
         
@@ -339,6 +344,10 @@ class HubSpotHandler(BaseETLHandler):
             owner_column = "hubspot_owner_id"
             if owner_column not in cols:
                 cols.append(owner_column)
+
+        # Preserve associatedcompanyid for contacts so we can derive accountId later
+        if stream == "contacts" and "associatedcompanyid" in df.columns:
+            cols.append("associatedcompanyid")
         
         # Ensure unique columns
         unique_cols = []
@@ -347,6 +356,57 @@ class HubSpotHandler(BaseETLHandler):
                 unique_cols.append(col)
         
         return df[unique_cols].copy(), owner_column
+    
+    def _attach_contact_account_id(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        For HubSpot contacts, append accountId by mapping associatedcompanyid to
+        CBX1 company ID using the companies snapshot.
+
+        Mapping logic:
+        - associatedcompanyid (HubSpot company remote id) -> match to companies snapshot RemoteId
+        - accountId output field <- companies snapshot InputId (CBX1 id)
+
+        If no snapshot or no match, accountId will be null.
+        """
+        if df is None or df.empty or "associatedcompanyid" not in df.columns:
+            return df
+
+        # Read companies snapshot (stores InputId and RemoteId)
+        companies_snap = self.read_snapshot("companies")
+        if companies_snap is None or companies_snap.empty:
+            return df
+
+        # Prepare for join
+        tmp = companies_snap.rename(columns={"RemoteId": "__company_remote_id", "InputId": "accountId"}).copy()
+        # Normalize types for safe join
+        df["associatedcompanyid"] = df["associatedcompanyid"].astype("string")
+        tmp["__company_remote_id"] = tmp["__company_remote_id"].astype("string")
+
+        merged = df.merge(
+            tmp[["__company_remote_id", "accountId"]],
+            left_on="associatedcompanyid",
+            right_on="__company_remote_id",
+            how="left",
+        )
+        merged = merged.drop(columns=["__company_remote_id"], errors="ignore")
+        return merged
+    
+    def _post_process_contacts(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Post-process contacts stream after mapping/enrichment:
+        - Attach accountId by mapping associatedcompanyid -> companies snapshot
+        - Drop the temporary associatedcompanyid column from the final output
+
+        Args:
+            df: Contacts DataFrame
+
+        Returns:
+            DataFrame with accountId attached and helper columns removed
+        """
+        df = self._attach_contact_account_id(df)
+        if "associatedcompanyid" in df.columns:
+            df = df.drop(columns=["associatedcompanyid"], errors="ignore")
+        return df
     
     def _merge_owner_details(
         self,
