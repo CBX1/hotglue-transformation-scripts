@@ -287,6 +287,10 @@ class HubSpotHandler(BaseETLHandler):
         if stream in {"contacts", "companies"}:
             stream_data = self._merge_owner_details(stream_data, owner_lookup, owner_column)
 
+        # For companies: derive ownershipType from is_public
+        if stream == "companies":
+            stream_data = self._apply_company_ownership_type(stream_data)
+
         # For contacts: post-process to attach accountId and drop helper columns
         if stream == "contacts":
             stream_data = self._post_process_contacts(stream_data)
@@ -348,6 +352,9 @@ class HubSpotHandler(BaseETLHandler):
         # Preserve associatedcompanyid for contacts so we can derive accountId later
         if stream == "contacts" and "associatedcompanyid" in df.columns:
             cols.append("associatedcompanyid")
+        # Preserve is_public for companies so we can derive ownershipType later
+        if stream == "companies" and "is_public" in df.columns:
+            cols.append("is_public")
         
         # Ensure unique columns
         unique_cols = []
@@ -406,6 +413,39 @@ class HubSpotHandler(BaseETLHandler):
         df = self._attach_contact_account_id(df)
         if "associatedcompanyid" in df.columns:
             df = df.drop(columns=["associatedcompanyid"], errors="ignore")
+        return df
+
+    def _apply_company_ownership_type(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Derive account ownershipType from company's is_public field.
+        - If is_public is true-like -> ownershipType = "PUBLIC"
+        - Else -> ownershipType = "PRIVATE"
+
+        This expects that the `is_public` column is available after mapping for the
+        companies stream. If it is missing, defaults to PRIVATE.
+        """
+        if df is None or df.empty:
+            return df
+
+        df = df.copy()
+        # Initialize as nulls by default
+        ownership = pd.Series([pd.NA] * len(df), dtype="string")
+
+        if "is_public" in df.columns:
+            ser = df["is_public"].astype("string").str.strip().str.lower()
+            notna_mask = ~df["is_public"].isna()
+            true_mask = ser == "true"
+            false_mask = ser == "false"
+            # Assign PUBLIC/PRIVATE for explicit true/false, leave others as null
+            ownership.loc[notna_mask & true_mask] = "PUBLIC"
+            ownership.loc[notna_mask & false_mask] = "PRIVATE"
+            # Drop helper column from final output
+            df = df.drop(columns=["is_public"], errors="ignore")
+        else:
+            # If column is missing, keep ownershipType as nulls
+            logger.info("companies stream missing 'is_public' column; leaving ownershipType null")
+
+        df["ownershipType"] = ownership
         return df
     
     def _merge_owner_details(
