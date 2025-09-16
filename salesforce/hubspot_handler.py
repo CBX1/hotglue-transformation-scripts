@@ -58,11 +58,13 @@ class HubSpotHandler(BaseETLHandler):
         Handle the write operation for HubSpot.
         
         This method:
-        1. Processes all available streams from the source
+        1. Processes the contacts stream from the source
         2. Applies HubSpot-specific transformations
-        3. Writes transformed data in HubSpot-compatible format
+        3. Writes transformed contact data in HubSpot-compatible format
         
-        Note: Association handling is delegated to HubSpot's internal systems.
+        Policy: Write jobs only push Contacts. Companies and other objects are not
+        written from this pipeline. Association handling is delegated to HubSpot's
+        internal systems.
         """
         if not self.mapping_for_flow:
             raise ValueError("No write mapping found for HubSpot flow")
@@ -70,18 +72,14 @@ class HubSpotHandler(BaseETLHandler):
         mapping = self.build_write_mapping()
         streams = self.list_available_streams()
         
-        logger.info(f"Processing {len(streams)} streams for HubSpot write operation")
+        logger.info(f"HubSpot write: evaluating {len(streams)} streams; only 'contacts' will be written")
         
         for stream in streams:
-            if stream not in mapping:
-                # Pass through unmapped streams without transformation
-                self._handle_passthrough_stream(stream)
-            elif stream == "contacts":
-                # Special handling for contacts
+            if stream == "contacts":
+                # Contacts are the only object we write to HubSpot
                 self._handle_contacts_write(mapping)
             else:
-                # Standard stream processing with mapping
-                self._handle_standard_stream_write(stream, mapping)
+                logger.info(f"HubSpot write: skipping non-contact stream '{stream}' by policy")
     
     def _handle_passthrough_stream(self, stream: str) -> None:
         """

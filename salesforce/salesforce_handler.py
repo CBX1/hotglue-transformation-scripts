@@ -54,10 +54,12 @@ class SalesforceHandler(BaseETLHandler):
         Handle the write operation for Salesforce.
         
         This method:
-        1. Processes all available streams from the source
+        1. Processes contact stream from the source
         2. Applies Salesforce-specific transformations
         3. Handles the Contact/Lead split based on account associations
         4. Writes transformed data in Salesforce-compatible format
+
+        Note: As per policy, write jobs only push Contacts (no Accounts or other objects).
         """
         if not self.mapping_for_flow:
             raise ValueError("No write mapping found for Salesforce flow")
@@ -65,18 +67,14 @@ class SalesforceHandler(BaseETLHandler):
         mapping = self.build_write_mapping()
         streams = self.list_available_streams()
         
-        logger.info(f"Processing {len(streams)} streams for Salesforce write operation")
+        logger.info(f"Salesforce write: evaluating {len(streams)} streams; only 'contacts' will be written")
         
         for stream in streams:
-            if stream not in mapping:
-                # Pass through unmapped streams without transformation
-                self._handle_passthrough_stream(stream)
-            elif stream == "contacts":
+            if stream == "contacts":
                 # Special handling for contacts (split into Contacts/Leads)
                 self._handle_contacts_write(mapping)
             else:
-                # Standard stream processing with mapping
-                self._handle_standard_stream_write(stream, mapping)
+                logger.info(f"Salesforce write: skipping non-contact stream '{stream}' by policy")
     
     def _handle_passthrough_stream(self, stream: str) -> None:
         """

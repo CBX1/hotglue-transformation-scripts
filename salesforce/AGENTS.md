@@ -73,6 +73,12 @@ Additional expectations:
 - HubSpot associations are NOT formatted by this transformation; HubSpot applies its own association rules downstream.
 - All outgoing data is serialized using `prepare_for_singer()` so datetime fields become Singer-friendly ISO strings.
 
+## Write Policy
+
+- For both connectors, write jobs only push `contacts`.
+- Salesforce: Only `Contact`/`Lead` are written (split determined by account linkage). `Account` (and other objects) are not written.
+- HubSpot: Only `contacts` are written. `companies` (and other objects) are not written.
+
 ## Commit & Pull Request Guidelines
 Write brief, imperative commit titles (e.g., "Refactor into connector handlers"). PR descriptions should:
 

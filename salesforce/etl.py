@@ -220,6 +220,8 @@ def main() -> None:
     connector_id = os.environ.get("CONNECTOR_ID")
     
     logger.info(f"Starting ETL job: type={job_type}, flow={flow_id}, connector={connector_id}")
+    if job_type == "write":
+        logger.info("Write Policy: Only 'contacts' will be pushed. Accounts/Companies and other objects are skipped.")
     
     if not connector_id:
         raise ValueError("CONNECTOR_ID environment variable is required")
