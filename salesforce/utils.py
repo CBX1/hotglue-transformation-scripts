@@ -1,41 +1,81 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+"""
+Utility functions for HotGlue ETL operations.
+
+This module provides common utility functions used across the ETL pipeline for:
+- Data reading and transformation
+- Field mapping and column renaming
+- Deduplication and snapshot management
+- Data type conversions and formatting
+- Nested structure transformations
+
+These utilities are designed to work with the HotGlue framework and support
+both Salesforce and HubSpot connector operations.
+"""
+
+import logging
+from typing import Dict, List, Optional, Tuple
+
 import pandas as pd
-from typing import Tuple, Optional
 import gluestick as gs
 
+logger = logging.getLogger(__name__)
 
-def get_stream_data(reader: gs.Reader, stream: str, catalog_types: bool = True):
+
+def get_stream_data(reader: gs.Reader, stream: str, catalog_types: bool = True) -> pd.DataFrame:
     """
-    Wrapper function to get stream data with catalog_types=True by default.
+    Retrieve data for a specific stream from the HotGlue reader.
     
-    This ensures consistent behavior across all reader.get() calls without
-    requiring developers to remember to pass catalog_types=True.
+    This wrapper ensures consistent behavior across all data reading operations
+    by defaulting catalog_types to True, which preserves data type information
+    from the source catalog.
     
     Args:
-        reader: The gluestick Reader instance
-        stream: Name of the stream to read
-        catalog_types: Whether to use catalog types (defaults to True)
+        reader: The gluestick Reader instance for accessing input data
+        stream: Name of the stream to read (e.g., 'contacts', 'accounts')
+        catalog_types: Whether to use catalog-defined types (defaults to True)
         
     Returns:
-        DataFrame with the stream data
+        DataFrame containing the stream data with appropriate typing
+        
+    Example:
+        >>> reader = gs.Reader('/path/to/data')
+        >>> contacts_df = get_stream_data(reader, 'contacts')
     """
     return reader.get(stream, catalog_types=catalog_types)
 
 
-def map_stream_data(stream_data: pd.DataFrame, stream: str, mapping: dict) -> Tuple[list, pd.DataFrame]:
+def map_stream_data(
+    stream_data: pd.DataFrame, 
+    stream: str, 
+    mapping: Dict[str, Dict]
+) -> Tuple[List[str], pd.DataFrame]:
     """
-    Maps data from source format to target format based on provided mapping configuration.
+    Transform data columns based on field mapping configuration.
+    
+    This function applies field mappings to transform source data into the target
+    format required by the destination system. It handles column renaming,
+    external ID generation, and ensures all required fields are present.
     
     Args:
-        stream_data: DataFrame containing the source data
-        stream: Name of the data stream being processed
-        mapping: Mapping configuration that defines field mappings between source and target
+        stream_data: DataFrame containing the source data to be transformed
+        stream: Name of the data stream being processed (e.g., 'contacts', 'accounts')
+        mapping: Nested dictionary with stream-specific field mappings
+                Format: {stream: {source_field: target_field, ...}}
         
     Returns:
-        (stream_columns, stream_data) where stream_columns is list of mapped column names
-        and stream_data is the transformed DataFrame.
+        Tuple containing:
+        - List of column names in the transformed data
+        - DataFrame with renamed columns and external ID added
     
     Raises:
-        ValueError: If mapping configuration is missing or invalid
+        ValueError: If mapping is missing or no mapping found for the stream
+        
+    Example:
+        >>> mapping = {'contacts': {'firstName': 'FirstName', 'email': 'Email'}}
+        >>> columns, df = map_stream_data(contacts_df, 'contacts', mapping)
     """
     # Validate inputs
     if not mapping:
@@ -44,46 +84,88 @@ def map_stream_data(stream_data: pd.DataFrame, stream: str, mapping: dict) -> Tu
     if stream not in mapping:
         raise ValueError(f"No mapping found for stream: {stream}")
     
-    stream_mapping = dict(mapping.get(stream))  # shallow copy to avoid side-effects
+    # Create a copy to avoid mutating the original mapping
+    stream_mapping = dict(mapping.get(stream))
     
-    # Ensure remote_id is set in mapping (do not mutate caller's dict)
+    # Ensure remote_id mapping is present (standard field for ID tracking)
     stream_mapping.setdefault("remote_id", "Id")
 
     target_api_columns = list(stream_mapping.keys())
     connector_columns = list(stream_mapping.values())
 
+    # Identify columns that need to be renamed
     columns_to_rename = [
-        column
-        for column in stream_data.columns
+        column for column in stream_data.columns
         if column in target_api_columns
     ]
     
-    # Rename columns using mapping configuration
+    # Apply column renaming based on mapping
     for column in columns_to_rename:
         try:
             target_column = connector_columns[target_api_columns.index(column)]
             stream_data[target_column] = stream_data[column]
         except Exception as e:
-            print(f"Warning: Error renaming column {column}: {str(e)}")
+            logger.warning(f"Error renaming column {column}: {str(e)}")
 
+    # Build list of columns present in the data
     stream_columns = [
         col for col in connector_columns if col in stream_data.columns
     ]
 
-    # Map id => external_id
+    # Add external ID for tracking (maps internal ID to external system)
     if "id" in stream_data.columns:
         stream_columns.append("externalId")
         stream_data["externalId"] = stream_data["id"]
 
-    # Remove duplicates while preserving order
+    # Remove duplicate column names while preserving order
     unique_columns = []
     for col in stream_columns:
         if col not in unique_columns:
             unique_columns.append(col)
     
-    stream_data = stream_data[unique_columns]
+    # Return only the mapped columns
+    stream_data = stream_data[unique_columns].copy()
 
     return unique_columns, stream_data
+
+
+def prepare_for_singer(df: Optional[pd.DataFrame]) -> pd.DataFrame:
+    """
+    Prepare DataFrame for Singer format output.
+    
+    Singer is a specification for data exchange that requires specific formatting,
+    particularly for datetime fields. This function ensures all datetime columns
+    are properly serialized to ISO 8601 format strings.
+    
+    Args:
+        df: DataFrame to prepare for Singer output
+        
+    Returns:
+        DataFrame with datetime columns converted to Singer-compatible strings
+        
+    Raises:
+        ValueError: If input is None instead of a DataFrame
+        
+    Note:
+        Singer format requires datetime fields to be in ISO 8601 format:
+        YYYY-MM-DDTHH:MM:SS.ffffffZ
+    """
+    if df is None:
+        raise ValueError("Expected DataFrame, received None")
+
+    prepared_df = df.copy()
+    
+    # Find all datetime columns
+    datetime_cols = prepared_df.select_dtypes(include=["datetime", "datetimetz"]).columns
+
+    # Convert datetime columns to ISO 8601 string format
+    for col in datetime_cols:
+        series = prepared_df[col]
+        formatted = series.dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ").where(series.notna(), None)
+        prepared_df = prepared_df.astype({col: "object"})
+        prepared_df.loc[:, col] = formatted
+
+    return prepared_df
 
 
 def drop_sent_records(
@@ -93,16 +175,27 @@ def drop_sent_records(
     new_data: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """
-    Filters out records that have already been sent to avoid duplicates.
+    Filter out records that have already been sent to prevent duplicates.
+    
+    This deduplication function compares current data against historical snapshots
+    to identify records that have not been sent yet. For contacts, it also
+    includes records that have been updated since the last sync.
     
     Args:
-        stream (str): Name of the data stream being processed
-        stream_data (pd.DataFrame): DataFrame containing the current data
-        sent_data (pd.DataFrame): DataFrame containing previously sent records
-        new_data (pd.DataFrame, optional): DataFrame containing new/updated records
+        stream: Name of the data stream being processed (e.g., 'contacts', 'accounts')
+        stream_data: DataFrame containing the current batch of data
+        sent_data: DataFrame containing previously sent records from snapshots
+        new_data: Optional DataFrame containing records with updates (used for contacts)
         
     Returns:
-        Filtered DataFrame containing only unsent/updated records
+        DataFrame containing only records that haven't been sent or have updates
+        
+    Raises:
+        ValueError: If required ID columns are missing
+        
+    Note:
+        - Uses 'externalId' in stream_data and 'InputId' in sent_data for comparison
+        - For contacts stream, includes updated records even if previously sent
     """
     # If no sent data, return all stream data
     if sent_data is None:
@@ -123,23 +216,36 @@ def drop_sent_records(
         if "externalId" in new_data.columns:
             condition = condition | (stream_data["externalId"].isin(new_data["externalId"]))
 
-    return stream_data[condition]
+    return stream_data.loc[condition].copy()
 
 
-def split_contacts_by_account(contacts: pd.DataFrame, sent_accounts: pd.DataFrame):
+def split_contacts_by_account(
+    contacts: pd.DataFrame, 
+    sent_accounts: pd.DataFrame
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Splits contact records into contacts and leads based on account association.
+    Split contacts into Contacts and Leads based on account associations.
+    
+    Salesforce distinguishes between Contacts (associated with accounts) and
+    Leads (not yet associated with accounts). This function performs that split
+    based on whether a contact has a valid account association.
     
     Args:
-        contacts (pd.DataFrame): DataFrame containing all contact records
-        sent_accounts (pd.DataFrame): DataFrame containing account records that have been sent
+        contacts: DataFrame containing all contact records
+        sent_accounts: DataFrame containing accounts that have been synced
+                      Must contain 'AccountId' and 'RemoteAccountId' columns
         
     Returns:
-        (contacts_df, leads_df) where contacts_df contains records with existing accounts
-        and leads_df contains records with missing accounts
+        Tuple of (contacts_df, leads_df):
+        - contacts_df: Records with valid account associations
+        - leads_df: Records without account associations (will become Leads)
     
     Raises:
         ValueError: If required columns are missing from input DataFrames
+        
+    Note:
+        This is specific to Salesforce's Contact/Lead model. Other CRMs
+        may not make this distinction.
     """
     # Validate required columns
     if "accountId" not in contacts.columns:
@@ -148,23 +254,27 @@ def split_contacts_by_account(contacts: pd.DataFrame, sent_accounts: pd.DataFram
     if "AccountId" not in sent_accounts.columns or "RemoteAccountId" not in sent_accounts.columns:
         raise ValueError("AccountId and RemoteAccountId columns are required in sent_accounts DataFrame")
     
+    # Join contacts with accounts to identify associations
     contacts_data = contacts.copy()
     contacts_data = contacts_data.merge(
         sent_accounts, left_on="accountId", right_on="AccountId", how="left"
     )
     
-    # Handle cases where account mapping might be missing
+    # Mark records without account associations
     contacts_data["RemoteAccountId"] = contacts_data["RemoteAccountId"].fillna("missing")
     
+    # Split based on account association
     contacts_df = contacts_data[contacts_data["RemoteAccountId"] != "missing"].copy()
     leads_df = contacts_data[contacts_data["RemoteAccountId"] == "missing"].copy()
     
-    # Drop AccountId columns to avoid duplication
+    # Clean up temporary columns
     if "AccountId" in contacts_df.columns:
         contacts_df.drop(columns=['AccountId', 'RemoteAccountId'], inplace=True, errors="ignore")
     
     if "AccountId" in leads_df.columns:
         leads_df.drop(columns=['AccountId', 'RemoteAccountId'], inplace=True, errors="ignore")
+    
+    logger.info(f"Split {len(contacts)} contacts into {len(contacts_df)} Contacts and {len(leads_df)} Leads")
     
     return contacts_df, leads_df
 
@@ -328,31 +438,51 @@ def get_contact_data(
     leads: Optional[pd.DataFrame],
 ) -> pd.DataFrame:
     """
-    Gets the appropriate contact data based on connector ID and stream type.
+    Select the appropriate contact dataset based on connector and stream type.
+    
+    Different CRM systems handle contacts differently:
+    - Salesforce: Distinguishes between Contacts (with accounts) and Leads (without)
+    - HubSpot: Has a single contacts stream
+    
+    This function returns the correct dataset based on these requirements.
     
     Args:
-        connector_id (str): ID of the connector being used (e.g. 'salesforce', 'hubspot')
-        stream (str): Type of stream ('Contact' or 'Lead') # only for salesforce
-        contacts (pd.DataFrame): DataFrame containing contact records
-        leads (pd.DataFrame): DataFrame containing lead records
+        connector_id: CRM connector identifier ('salesforce', 'hubspot', etc.)
+        stream: Stream type - 'Contact' or 'Lead' (only relevant for Salesforce)
+        contacts: DataFrame containing contact records
+        leads: DataFrame containing lead records (only used for Salesforce)
         
     Returns:
-        pd.DataFrame: Contact or lead data based on connector and stream type.
-        Returns contacts for non-Salesforce connectors, and the appropriate
-        stream data (contacts/leads) for Salesforce.
+        DataFrame with the appropriate contact/lead data for the connector
+        Returns empty DataFrame if the requested data is None
     
     Raises:
         ValueError: If stream type is invalid for Salesforce connector
+        
+    Example:
+        >>> # For Salesforce Contact stream
+        >>> df = get_contact_data('salesforce', 'Contact', contacts_df, leads_df)
+        >>> # For HubSpot (stream parameter is ignored)
+        >>> df = get_contact_data('hubspot', 'any', contacts_df, None)
     """
     if connector_id == "salesforce":
         if stream not in ["Contact", "Lead"]:
-            raise ValueError(f"Invalid stream type for Salesforce: {stream}. Expected 'Contact' or 'Lead'.")
+            raise ValueError(
+                f"Invalid stream type for Salesforce: {stream}. "
+                f"Expected 'Contact' or 'Lead'."
+            )
         
         # Return appropriate data based on stream type
         if stream == "Contact":
-            return contacts if contacts is not None else pd.DataFrame()
+            result = contacts if contacts is not None else pd.DataFrame()
+            logger.debug(f"Returning {len(result)} Contact records for Salesforce")
+            return result
         else:  # stream == "Lead"
-            return leads if leads is not None else pd.DataFrame()
+            result = leads if leads is not None else pd.DataFrame()
+            logger.debug(f"Returning {len(result)} Lead records for Salesforce")
+            return result
     else:
         # For non-Salesforce connectors, always return contacts
-        return contacts if contacts is not None else pd.DataFrame()
+        result = contacts if contacts is not None else pd.DataFrame()
+        logger.debug(f"Returning {len(result)} contact records for {connector_id}")
+        return result
