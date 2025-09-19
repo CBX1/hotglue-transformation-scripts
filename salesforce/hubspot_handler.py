@@ -217,6 +217,7 @@ class HubSpotHandler(BaseETLHandler):
             return None
         
         owners_df = self.get_stream_data("owners")
+        owners_df = self._filter_archived_records(owners_df, "owners")
         if owners_df is None or owners_df.empty:
             logger.info("Owners stream is empty")
             return None
@@ -270,8 +271,9 @@ class HubSpotHandler(BaseETLHandler):
         logger.info(f"Processing read stream: {stream}")
         
         stream_data = self.get_stream_data(stream)
+        stream_data = self._filter_archived_records(stream_data, stream)
         owner_column = None
-        
+
         if stream not in mapping:
             logger.info(f"No mapping for stream {stream}, passing through")
         else:
@@ -306,6 +308,25 @@ class HubSpotHandler(BaseETLHandler):
         output_stream = inverse_mapping.get(stream, stream)
         
         self._write_read_output(stream_data, output_stream)
+
+    def _filter_archived_records(
+        self,
+        df: Optional[pd.DataFrame],
+        stream: str
+    ) -> Optional[pd.DataFrame]:
+        """Remove archived records from the provided DataFrame."""
+        if df is None or df.empty or "archived" not in df.columns:
+            return df
+
+        df = df.copy()
+        archived_mask = df["archived"].fillna(False)
+        filtered_df = df.loc[~archived_mask].copy()
+        removed = len(df) - len(filtered_df)
+        if removed:
+            logger.debug(
+                f"HubSpot read: skipped {removed} archived records from '{stream}'"
+            )
+        return filtered_df
     
     def _apply_read_mapping(
         self,
