@@ -439,11 +439,11 @@ class HubSpotHandler(BaseETLHandler):
     def _apply_company_ownership_type(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         Derive account ownershipType from company's is_public field.
-        - If is_public is true-like -> ownershipType = "PUBLIC"
-        - Else -> ownershipType = "PRIVATE"
+        - If is_public is true-like -> ownershipType = "Public"
+        - Else -> ownershipType = "Private"
 
         This expects that the `is_public` column is available after mapping for the
-        companies stream. If it is missing, defaults to PRIVATE.
+        companies stream. If it is missing, defaults to Private.
         """
         if df is None or df.empty:
             return df
@@ -458,8 +458,8 @@ class HubSpotHandler(BaseETLHandler):
             true_mask = ser == "true"
             false_mask = ser == "false"
             # Assign PUBLIC/PRIVATE for explicit true/false, leave others as null
-            ownership.loc[notna_mask & true_mask] = "PUBLIC"
-            ownership.loc[notna_mask & false_mask] = "PRIVATE"
+            ownership.loc[notna_mask & true_mask] = "Public"
+            ownership.loc[notna_mask & false_mask] = "Private"
             # Drop helper column from final output
             df = df.drop(columns=["is_public"], errors="ignore")
         else:
