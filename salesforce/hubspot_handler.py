@@ -10,7 +10,7 @@ so this handler does not include association logic.
 """
 
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 import pandas as pd
 import numpy as np
@@ -40,6 +40,8 @@ class HubSpotHandler(BaseETLHandler):
     so this handler does not handle association logic.
     """
     
+    READ_ONLY_FIELDS: Set[str] = {"hs_email_optout"}
+
     def __init__(self, *args, target_config: Optional[Dict] = None, **kwargs):
         """
         Initialize the HubSpot handler.
@@ -128,42 +130,36 @@ class HubSpotHandler(BaseETLHandler):
         """
         logger.info("Processing contacts for HubSpot")
         
-        # Check if we have sent accounts (required for contact processing)
-        sent_accounts = self.read_snapshot(self.stream_name_mapping.get('accounts', 'companies'))
-        if sent_accounts is None:
-            logger.warning("No accounts have been sent yet, skipping contacts export")
-            return
-        
-        # Prepare account data
-        sent_accounts = sent_accounts.rename(
-            columns={"InputId": "AccountId", "RemoteId": "RemoteAccountId"}
-        )
-        sent_accounts = sent_accounts[sent_accounts["RemoteAccountId"].notna()]
-        
         # Get contact data
         contacts_df = self.get_stream_data("contacts")
         
         # Apply mapping for contacts
         mapping_name = "contacts"
         stream_columns, contacts_df = map_stream_data(contacts_df, mapping_name, mapping)
+
+        # Remove HubSpot read-only fields so we never attempt to update them
+        read_only_columns = [col for col in stream_columns if col in self.READ_ONLY_FIELDS]
+        if read_only_columns:
+            contacts_df = contacts_df.drop(columns=read_only_columns, errors="ignore")
+            stream_columns = [col for col in stream_columns if col not in self.READ_ONLY_FIELDS]
+
         new_data = contacts_df.copy()
         
         # Create snapshot for tracking
         snap = self.write_snapshot(contacts_df, mapping_name)
         if "hash" in snap.columns:
             snap = snap.drop(columns=["hash"])
-        
-        # Merge in account remote IDs (for reference only, not for associations)
-        snap = snap.merge(sent_accounts, on="AccountId", how="left")
-        snap = snap.rename(
-            columns={
-                "AccountId": "InputAccountId",
-                "RemoteAccountId": "AccountId"
-            }
-        )
-        
+
         # Prepare final output (without association formatting)
-        df_out = snap[list(set(stream_columns))].copy()
+        ordered_columns = []
+        for col in stream_columns:
+            if col not in ordered_columns:
+                ordered_columns.append(col)
+
+        account_fields = {"AccountId", "accountId", "InputAccountId", "RemoteAccountId"}
+        ignored_fields = account_fields.union(self.READ_ONLY_FIELDS)
+        output_columns = [col for col in ordered_columns if col not in ignored_fields]
+        df_out = snap[output_columns].copy()
         
         # Filter out already sent records
         sent_contacts = self.read_snapshot(self.stream_name_mapping[mapping_name])
