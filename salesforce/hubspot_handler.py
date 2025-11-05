@@ -125,17 +125,22 @@ class HubSpotHandler(BaseETLHandler):
         This method processes contacts without handling associations,
         as associations are managed by HubSpot's internal systems.
         
+        Additionally, for contacts with globalUnsubscribe=true, this method
+        calls the HubSpot communication preferences API to unsubscribe them
+        from all email communications.
+        
         Args:
             mapping: Field mapping configuration
         """
         logger.info("Processing contacts for HubSpot")
         
         # Get contact data
-        contacts_df = self.get_stream_data("contacts")
+        contacts_df_raw = self.get_stream_data("contacts")
+
         
         # Apply mapping for contacts
         mapping_name = "contacts"
-        stream_columns, contacts_df = map_stream_data(contacts_df, mapping_name, mapping)
+        stream_columns, contacts_df = map_stream_data(contacts_df_raw, mapping_name, mapping)
 
         # Remove HubSpot read-only fields so we never attempt to update them
         read_only_columns = [col for col in stream_columns if col in self.READ_ONLY_FIELDS]
@@ -168,6 +173,84 @@ class HubSpotHandler(BaseETLHandler):
         # Write to output
         self.write_to_singer(df_out, self.stream_name_mapping[mapping_name])
         logger.info(f"Processed {len(df_out)} contact records for HubSpot")
+                
+        # This checks the raw source data for globalUnsubscribe field
+        self._handle_global_unsubscribe(contacts_df_raw)
+    
+    def _handle_global_unsubscribe(self, contacts_df: pd.DataFrame) -> None:
+        """
+        Handle global unsubscribe for contacts with globalUnsubscribe field set to true.
+        
+        This method identifies contacts that should be unsubscribed from all email
+        communications and writes them to the HubSpot communication preferences API
+        using the full API path approach.
+        
+        Args:
+            contacts_df: DataFrame containing contact data with potential globalUnsubscribe field
+        """
+        if contacts_df is None or contacts_df.empty:
+            logger.info("No contacts to check for global unsubscribe")
+            return
+        
+        # Check if globalUnsubscribe field exists
+        if "globalUnsubscribe" not in contacts_df.columns:
+            logger.info("No globalUnsubscribe field found in contacts data")
+            return
+        
+        # Filter contacts with globalUnsubscribe=true
+        unsubscribe_mask = contacts_df["globalUnsubscribe"].fillna(False)
+        # Handle various truthy values (True, "true", "True", 1, "1")
+        if unsubscribe_mask.dtype == "object":
+            unsubscribe_mask = unsubscribe_mask.astype(str).str.strip().str.lower().isin(["true", "1"])
+        else:
+            unsubscribe_mask = unsubscribe_mask.astype(bool)
+        
+        contacts_to_unsubscribe = contacts_df[unsubscribe_mask].copy()
+        
+        if contacts_to_unsubscribe.empty:
+            logger.info("No contacts with globalUnsubscribe=true found")
+            return
+        
+        # Extract email addresses for unsubscribe API call
+        if "email" not in contacts_to_unsubscribe.columns:
+            logger.warning(
+                f"Found {len(contacts_to_unsubscribe)} contacts with globalUnsubscribe=true "
+                "but no email field available. Cannot process unsubscribe."
+            )
+            return
+        
+        # Get valid email addresses (non-null, non-empty)
+        emails_series = contacts_to_unsubscribe["email"].dropna()
+        emails_series = emails_series[emails_series.astype(str).str.strip() != ""]
+        emails_to_unsubscribe = emails_series.tolist()
+        
+        if not emails_to_unsubscribe:
+            logger.warning(
+                f"Found {len(contacts_to_unsubscribe)} contacts with globalUnsubscribe=true "
+                "but no valid email addresses. Cannot process unsubscribe."
+            )
+            return
+        
+        logger.info(
+            f"Processing global unsubscribe for {len(emails_to_unsubscribe)} contacts "
+            "via HubSpot communication preferences API"
+        )
+        
+        # Prepare data for the communication preferences API
+        # Using the full API path approach as documented in target-hubspot-v4
+        unsubscribe_stream_name = "/communication-preferences/v4/statuses/batch/unsubscribe-all?channel=EMAIL"
+        
+        # Create a DataFrame with the required structure for the API
+        unsubscribe_data = pd.DataFrame({
+            "inputs": [emails_to_unsubscribe]
+        })
+        
+        # Write to the communication preferences API stream
+        self.write_to_singer(unsubscribe_data, unsubscribe_stream_name)
+        logger.info(
+            f"Successfully queued {len(emails_to_unsubscribe)} contacts for global unsubscribe "
+            f"via stream: {unsubscribe_stream_name}"
+        )
     
     def handle_read(self) -> None:
         """
