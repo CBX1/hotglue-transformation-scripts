@@ -1,0 +1,14 @@
+{"type": "SCHEMA", "stream": "contacts", "schema": {"type": ["object", "null"], "properties": {"email": {"type": ["string", "null"]}, "firstname": {"type": ["string", "null"]}, "hs_linkedin_url": {"type": ["string", "null"]}, "seniority": {"type": ["string", "null"]}, "job_function": {"type": ["string", "null"]}, "jobtitle": {"type": ["string", "null"]}, "lastname": {"type": ["string", "null"]}, "phone": {"type": ["string", "null"]}, "salutation": {"type": ["string", "null"]}, "website": {"type": ["string", "null"]}, "id": {"type": ["string", "null"]}, "externalId": {"type": ["string", "null"]}}}, "key_properties": []}
+{"type": "RECORD", "stream": "contacts", "record": {"email": "bh@hubspot.com", "firstname": "Brian", "jobtitle": "Executive Chairperson", "lastname": "Halligan (sample Contact)", "website": "hubspot.com", "id": "311704931063", "externalId": "311704931063"}}
+{"type": "RECORD", "stream": "contacts", "record": {"email": "emailmaria@hubspot.com", "firstname": "Maria", "jobtitle": "Salesperson", "lastname": "Johnson (sample Contact)", "website": "hubspot.com", "id": "311701462722", "externalId": "311701462722"}}
+{"type": "RECORD", "stream": "contacts", "record": {"email": "diana.brown@phillips.com", "firstname": "Diana", "hs_linkedin_url": "https://www.linkedin.com/in/dianabrown55", "seniority": "VP-Level", "job_function": "C-Suite", "jobtitle": "Soil scientist", "lastname": "Brown", "phone": "+12839759478", "salutation": "Dr.", "website": "phillips.com"}}
+{"type": "STATE", "value": {}}
+{"type": "SCHEMA", "stream": "communication-preferences/v4/statuses/tvn.reddy@aptean.com/unsubscribe-all?channel=EMAIL", "schema": {"type": ["object", "null"], "properties": {}}, "key_properties": []}
+{"type": "RECORD", "stream": "communication-preferences/v4/statuses/tvn.reddy@aptean.com/unsubscribe-all?channel=EMAIL", "record": {}}
+{"type": "STATE", "value": {}}
+{"type": "SCHEMA", "stream": "communication-preferences/v4/statuses/janice.rivera@hernandez.info/unsubscribe-all?channel=EMAIL", "schema": {"type": ["object", "null"], "properties": {}}, "key_properties": []}
+{"type": "RECORD", "stream": "communication-preferences/v4/statuses/janice.rivera@hernandez.info/unsubscribe-all?channel=EMAIL", "record": {}}
+{"type": "STATE", "value": {}}
+{"type": "SCHEMA", "stream": "communication-preferences/v4/statuses/diana.brown@phillips.com/unsubscribe-all?channel=EMAIL", "schema": {"type": ["object", "null"], "properties": {}}, "key_properties": []}
+{"type": "RECORD", "stream": "communication-preferences/v4/statuses/diana.brown@phillips.com/unsubscribe-all?channel=EMAIL", "record": {}}
+{"type": "STATE", "value": {}}

@@ -14,6 +14,7 @@ from typing import Dict, List, Optional, Set
 
 import pandas as pd
 import numpy as np
+import gluestick as gs
 
 from base_handler import BaseETLHandler
 from utils import (
@@ -183,7 +184,7 @@ class HubSpotHandler(BaseETLHandler):
         
         This method identifies contacts that should be unsubscribed from all email
         communications and writes them to the HubSpot communication preferences API
-        using the full API path approach.
+        individually (not using batch operations, as batch requires Marketing Enterprise).
         
         Args:
             contacts_df: DataFrame containing contact data with potential globalUnsubscribe field
@@ -233,23 +234,33 @@ class HubSpotHandler(BaseETLHandler):
         
         logger.info(
             f"Processing global unsubscribe for {len(emails_to_unsubscribe)} contacts "
-            "via HubSpot communication preferences API"
+            "via HubSpot communication preferences API (individual requests)"
         )
         
-        # Prepare data for the communication preferences API
-        # Using the full API path approach as documented in target-hubspot-v4
-        unsubscribe_stream_name = "/communication-preferences/v4/statuses/batch/unsubscribe-all?channel=EMAIL"
+        # Process each email individually to avoid requiring Marketing Enterprise
+        # Using individual API calls instead of batch operations
+        for email in emails_to_unsubscribe:
+            # Create stream name with email embedded in the path
+            stream_name = f"communication-preferences/v4/statuses/{email}/unsubscribe-all?channel=EMAIL"
+            
+            # Create a DataFrame with a single row but no columns (as per documentation)
+            # The email is embedded in the URL path, so no data payload is needed
+            empty_df = pd.DataFrame(index=pd.Index([0]))
+            
+            # Bypass the empty check and write directly using gs.to_singer
+            # since write_to_singer would reject this as empty
+            output_df = empty_df.copy()
+            gs.to_singer(
+                output_df,
+                stream_name,
+                self.output_dir,
+                allow_objects=True,
+            )
+            logger.debug(f"Wrote unsubscribe request for: {email}")
         
-        # Create a DataFrame with the required structure for the API
-        unsubscribe_data = pd.DataFrame({
-            "inputs": [emails_to_unsubscribe]
-        })
-        
-        # Write to the communication preferences API stream
-        self.write_to_singer(unsubscribe_data, unsubscribe_stream_name)
         logger.info(
             f"Successfully queued {len(emails_to_unsubscribe)} contacts for global unsubscribe "
-            f"via stream: {unsubscribe_stream_name}"
+            "via individual API calls"
         )
     
     def handle_read(self) -> None:
