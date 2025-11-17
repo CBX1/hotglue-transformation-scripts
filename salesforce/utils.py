@@ -93,12 +93,16 @@ def map_stream_data(
     target_api_columns = list(stream_mapping.keys())
     connector_columns = list(stream_mapping.values())
 
+    # Preserve the original 'id' column value BEFORE mapping
+    # This is critical for write operations where we need to track the source system ID
+    original_id = stream_data["id"].copy() if "id" in stream_data.columns else None
+
     # Identify columns that need to be renamed
     columns_to_rename = [
         column for column in stream_data.columns
         if column in target_api_columns
     ]
-    
+
     # Apply column renaming based on mapping
     for column in columns_to_rename:
         try:
@@ -113,9 +117,10 @@ def map_stream_data(
     ]
 
     # Add external ID for tracking (maps internal ID to external system)
-    if "id" in stream_data.columns:
+    # Use the ORIGINAL id value (before mapping), not the mapped value
+    if original_id is not None:
         stream_columns.append("externalId")
-        stream_data["externalId"] = stream_data["id"]
+        stream_data["externalId"] = original_id
 
     # Remove duplicate column names while preserving order
     unique_columns = []
