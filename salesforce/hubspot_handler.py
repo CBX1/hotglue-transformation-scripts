@@ -150,13 +150,11 @@ class HubSpotHandler(BaseETLHandler):
             stream_columns = [col for col in stream_columns if col not in self.READ_ONLY_FIELDS]
 
         new_data = contacts_df.copy()
-        
-        # Create snapshot for tracking
-        snap = self.write_snapshot(contacts_df, mapping_name)
-        if "hash" in snap.columns:
-            snap = snap.drop(columns=["hash"])
 
         # Prepare final output (without association formatting)
+        # Note: For WRITE operations, we don't create a merged snapshot to avoid
+        # mixing READ (HubSpot->CBX1) and WRITE (CBX1->HubSpot) data.
+        # The CSV snapshot tracks previously sent records correctly.
         ordered_columns = []
         for col in stream_columns:
             if col not in ordered_columns:
@@ -165,10 +163,14 @@ class HubSpotHandler(BaseETLHandler):
         account_fields = {"AccountId", "accountId", "InputAccountId", "RemoteAccountId"}
         ignored_fields = account_fields.union(self.READ_ONLY_FIELDS)
         output_columns = [col for col in ordered_columns if col not in ignored_fields]
-        df_out = snap[output_columns].copy()
-        
+        df_out = contacts_df[output_columns].copy()
+
         # Filter out already sent records
-        sent_contacts = self.read_snapshot(self.stream_name_mapping[mapping_name])
+        # Read the CSV snapshot directly (with flow_id suffix) to avoid loading
+        # the parquet snapshot which may contain mixed READ/WRITE data
+        import gluestick as gs
+        snapshot_name = f"{self.stream_name_mapping[mapping_name]}_{self.flow_id}"
+        sent_contacts = gs.read_snapshots(snapshot_name, self.snapshot_dir)
         df_out = drop_sent_records("contacts", df_out, sent_contacts, new_data)
         
         # Write to output
