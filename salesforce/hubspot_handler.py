@@ -41,7 +41,16 @@ class HubSpotHandler(BaseETLHandler):
     so this handler does not handle association logic.
     """
     
-    READ_ONLY_FIELDS: Set[str] = {"hs_email_optout"}
+    # Fields that are read-only in HubSpot and should not be synced from Different to HubSpot
+    READ_ONLY_FIELDS: Set[str] = {
+        "hs_email_optout",
+        "createdate",
+        "notes_last_updated",
+        "hs_last_sales_activity_timestamp",
+        "notes_last_contacted",
+        "hs_latest_source_timestamp",
+        "hs_email_last_click_date",
+    }
 
     def __init__(self, *args, target_config: Optional[Dict] = None, **kwargs):
         """
@@ -144,10 +153,10 @@ class HubSpotHandler(BaseETLHandler):
         stream_columns, contacts_df = map_stream_data(contacts_df_raw, mapping_name, mapping)
 
         # Remove HubSpot read-only fields so we never attempt to update them
-        read_only_columns = [col for col in stream_columns if col in self.READ_ONLY_FIELDS]
-        if read_only_columns:
-            contacts_df = contacts_df.drop(columns=read_only_columns, errors="ignore")
-            stream_columns = [col for col in stream_columns if col not in self.READ_ONLY_FIELDS]
+        # Filter from stream_columns list
+        stream_columns = [col for col in stream_columns if col not in self.READ_ONLY_FIELDS]
+        # Also drop directly from DataFrame to catch any columns not tracked in stream_columns
+        contacts_df = contacts_df.drop(columns=list(self.READ_ONLY_FIELDS), errors="ignore")
 
         new_data = contacts_df.copy()
 
@@ -515,17 +524,63 @@ class HubSpotHandler(BaseETLHandler):
         """
         Post-process contacts stream after mapping/enrichment:
         - Attach accountId by mapping associatedcompanyid -> companies snapshot
+        - Derive emailBounceType from HubSpot email bounce fields
         - Drop the temporary associatedcompanyid column from the final output
 
         Args:
             df: Contacts DataFrame
 
         Returns:
-            DataFrame with accountId attached and helper columns removed
+            DataFrame with accountId attached, emailBounceType derived, and helper columns removed
         """
         df = self._attach_contact_account_id(df)
+        df = self._derive_bounce_type(df)
         if "associatedcompanyid" in df.columns:
             df = df.drop(columns=["associatedcompanyid"], errors="ignore")
+        return df
+
+    def _derive_bounce_type(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Derive emailBounceType field from HubSpot email bounce fields.
+
+        Maps to backend enum: ai.cbx1.targetmanagement.enums.EmailBounceType
+
+        Logic:
+            - If hs_email_hard_bounce_reason_enum is not null → HARD
+            - Else if hs_email_bounce > 0 → SOFT
+            - Else → NONE
+
+        Args:
+            df: Contacts DataFrame with HubSpot bounce fields
+
+        Returns:
+            DataFrame with emailBounceType field added
+        """
+        if df is None or df.empty:
+            return df
+
+        df = df.copy()
+
+        def determine_bounce_type(row):
+            hard_bounce_reason = row.get("hs_email_hard_bounce_reason_enum")
+            email_bounce = row.get("hs_email_bounce")
+
+            # Check for hard bounce first
+            if pd.notna(hard_bounce_reason) and hard_bounce_reason not in [None, "", "null"]:
+                return "HARD"
+
+            # Check for soft bounce
+            if pd.notna(email_bounce):
+                try:
+                    if float(email_bounce) > 0:
+                        return "SOFT"
+                except (ValueError, TypeError):
+                    pass
+
+            # Return NONE to match EmailBounceType enum
+            return "NONE"
+
+        df["emailBounceType"] = df.apply(determine_bounce_type, axis=1)
         return df
 
     def _apply_company_ownership_type(self, df: pd.DataFrame) -> pd.DataFrame:
