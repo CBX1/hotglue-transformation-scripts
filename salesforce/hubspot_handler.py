@@ -50,6 +50,7 @@ class HubSpotHandler(BaseETLHandler):
         "notes_last_contacted",
         "hs_latest_source_timestamp",
         "hs_email_last_click_date",
+        "crmListMembershipDetails",
     }
 
     def __init__(self, *args, target_config: Optional[Dict] = None, **kwargs):
@@ -277,31 +278,35 @@ class HubSpotHandler(BaseETLHandler):
     def handle_read(self) -> None:
         """
         Handle the read operation for HubSpot data.
-        
+
         This method:
         1. Reads data from HubSpot format
         2. Enriches with owner information when available
         3. Transforms to standardized data warehouse format
         4. Adds CBX1 IDs where available
         5. For contacts, adds accountId by mapping associatedcompanyid -> CBX1 company id
+        6. Populates crmListMembershipDetails from _hg_list_memberships
         """
         logger.info("Starting HubSpot read operation")
-        
+
         data_streams = self.list_available_streams()
         if not data_streams or not self.mapping_for_flow:
             logger.warning("No streams or mapping available for read operation")
             return
-        
+
         mapping = self.build_read_mapping()
-        
+
         # Prepare owner lookup for enrichment
         owner_lookup = self._prepare_owner_lookup(data_streams)
-        
+
+        # Prepare list lookup for CRM list membership enrichment
+        list_lookup = self._prepare_list_lookup(data_streams)
+
         # Only process relevant streams for data warehouse
-        target_streams = [s for s in data_streams if s in {"accounts", "contacts", "companies"}]
-        
+        target_streams = [s for s in data_streams if s in {"contacts", "companies"}]
+
         for stream in target_streams:
-            self._process_read_stream(stream, mapping, owner_lookup)
+            self._process_read_stream(stream, mapping, owner_lookup, list_lookup)
     
     def _prepare_owner_lookup(self, streams: List[str]) -> Optional[pd.DataFrame]:
         """
@@ -354,23 +359,132 @@ class HubSpotHandler(BaseETLHandler):
         
         logger.info(f"Created owner lookup with {len(lookup)} entries")
         return lookup
-    
+
+    def _prepare_list_lookup(self, streams: List[str]) -> Optional[Dict[str, str]]:
+        """
+        Create a lookup dictionary for HubSpot list information.
+
+        Maps list IDs to list names from the 'lists' stream.
+
+        Args:
+            streams: List of available stream names
+
+        Returns:
+            Dictionary mapping list ID (string) to list name, or None if not available
+        """
+        if "lists" not in streams:
+            logger.info("No lists stream available for list membership enrichment")
+            return None
+
+        lists_df = self.get_stream_data("lists")
+        if lists_df is None or lists_df.empty:
+            logger.info("Lists stream is empty")
+            return None
+
+        if "listId" not in lists_df.columns:
+            logger.warning("Lists stream missing 'listId' column")
+            return None
+
+        if "name" not in lists_df.columns:
+            logger.warning("Lists stream missing 'name' column")
+            return None
+
+        lookup = {}
+        for _, row in lists_df.iterrows():
+            list_id = str(row["listId"]) if pd.notna(row["listId"]) else None
+            list_name = str(row["name"]) if pd.notna(row["name"]) else None
+            if list_id and list_name:
+                lookup[list_id] = list_name
+
+        logger.info(f"Created list lookup with {len(lookup)} entries")
+        return lookup
+
+    def _populate_list_memberships(
+        self,
+        df: pd.DataFrame,
+        list_lookup: Optional[Dict[str, str]]
+    ) -> pd.DataFrame:
+        """
+        Populate crmListMembershipDetails from _hg_list_memberships field.
+
+        The _hg_list_memberships field contains list IDs. This method maps those
+        IDs to list names using the list_lookup and creates the crmListMembershipDetails
+        field as a list of objects with 'id' and 'name' properties.
+
+        Args:
+            df: DataFrame containing records with potential _hg_list_memberships
+            list_lookup: Dictionary mapping list ID to list name
+
+        Returns:
+            DataFrame with crmListMembershipDetails populated
+        """
+        if df is None or df.empty:
+            return df
+
+        df = df.copy()
+
+        if "_hg_list_memberships" not in df.columns:
+            logger.debug("No _hg_list_memberships field found")
+            df["crmListMembershipDetails"] = None
+            return df
+
+        def build_membership_details(list_memberships):
+            """Convert list IDs to list of {id, name} objects."""
+            if pd.isna(list_memberships) or list_memberships is None:
+                return None
+
+            list_ids = []
+            if isinstance(list_memberships, list):
+                list_ids = [str(lid) for lid in list_memberships if lid is not None]
+            elif isinstance(list_memberships, str):
+                try:
+                    import json
+                    parsed = json.loads(list_memberships)
+                    if isinstance(parsed, list):
+                        list_ids = [str(lid) for lid in parsed if lid is not None]
+                    else:
+                        list_ids = [str(list_memberships)]
+                except (json.JSONDecodeError, TypeError):
+                    list_ids = [lid.strip() for lid in str(list_memberships).split(",") if lid.strip()]
+            else:
+                list_ids = [str(list_memberships)]
+
+            if not list_ids:
+                return None
+
+            details = []
+            for lid in list_ids:
+                name = list_lookup.get(lid, "") if list_lookup else ""
+                details.append({"id": lid, "name": name})
+
+            return details if details else None
+
+        df["crmListMembershipDetails"] = df["_hg_list_memberships"].apply(build_membership_details)
+        df = df.drop(columns=["_hg_list_memberships"], errors="ignore")
+
+        non_null_count = df["crmListMembershipDetails"].notna().sum()
+        logger.info(f"Populated crmListMembershipDetails for {non_null_count} records")
+
+        return df
+
     def _process_read_stream(
         self,
         stream: str,
         mapping: Dict,
-        owner_lookup: Optional[pd.DataFrame]
+        owner_lookup: Optional[pd.DataFrame],
+        list_lookup: Optional[Dict[str, str]] = None
     ) -> None:
         """
         Process a single stream for read operation.
-        
+
         Args:
             stream: Name of the stream to process
             mapping: Field mapping configuration
             owner_lookup: Owner information lookup table
+            list_lookup: List ID to name lookup dictionary
         """
         logger.info(f"Processing read stream: {stream}")
-        
+
         stream_data = self.get_stream_data(stream)
         stream_data = self._filter_archived_records(stream_data, stream)
         owner_column = None
@@ -382,10 +496,10 @@ class HubSpotHandler(BaseETLHandler):
             stream_data, owner_column = self._apply_read_mapping(
                 stream_data, stream, mapping[stream]
             )
-            
+
             # Enrich with CBX1 IDs from snapshots
             stream_data = self._enrich_with_cbx1_ids(stream_data, stream)
-        
+
         # Enrich with owner information for contacts and companies
         if stream in {"contacts", "companies"}:
             stream_data = self._merge_owner_details(stream_data, owner_lookup, owner_column)
@@ -398,9 +512,13 @@ class HubSpotHandler(BaseETLHandler):
         if stream == "contacts":
             stream_data = self._post_process_contacts(stream_data)
 
+        # Populate CRM list membership details for contacts and companies
+        if stream in {"contacts", "companies"}:
+            stream_data = self._populate_list_memberships(stream_data, list_lookup)
+
         # Add CRM system identifier
         stream_data = self._add_crm_system(stream_data)
-        
+
         # Transform dot notation to nested structures
         stream_data = transform_dot_notation_to_nested(stream_data)
         
@@ -477,7 +595,10 @@ class HubSpotHandler(BaseETLHandler):
         # Preserve is_public for companies so we can derive ownershipType later
         if stream == "companies" and "is_public" in df.columns:
             cols.append("is_public")
-        
+        # Preserve _hg_list_memberships for list membership enrichment
+        if stream in {"contacts", "companies"} and "_hg_list_memberships" in df.columns:
+            cols.append("_hg_list_memberships")
+
         # Ensure unique columns
         unique_cols = []
         for col in cols:
