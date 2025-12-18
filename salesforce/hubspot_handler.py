@@ -50,7 +50,6 @@ class HubSpotHandler(BaseETLHandler):
         "notes_last_contacted",
         "hs_latest_source_timestamp",
         "hs_email_last_click_date",
-        # CRM list membership is populated from HubSpot during read, not written back
         "crmListMembershipDetails",
     }
 
@@ -304,7 +303,7 @@ class HubSpotHandler(BaseETLHandler):
         list_lookup = self._prepare_list_lookup(data_streams)
 
         # Only process relevant streams for data warehouse
-        target_streams = [s for s in data_streams if s in {"accounts", "contacts", "companies"}]
+        target_streams = [s for s in data_streams if s in {"contacts", "companies"}]
 
         for stream in target_streams:
             self._process_read_stream(stream, mapping, owner_lookup, list_lookup)
@@ -382,25 +381,17 @@ class HubSpotHandler(BaseETLHandler):
             logger.info("Lists stream is empty")
             return None
 
-        # HubSpot lists typically have 'listId' (or 'id') and 'name' columns
-        id_col = None
-        for col in ["listId", "id", "hs_list_id"]:
-            if col in lists_df.columns:
-                id_col = col
-                break
-
-        if id_col is None:
-            logger.warning("Lists stream missing ID column (listId, id, or hs_list_id)")
+        if "listId" not in lists_df.columns:
+            logger.warning("Lists stream missing 'listId' column")
             return None
 
         if "name" not in lists_df.columns:
             logger.warning("Lists stream missing 'name' column")
             return None
 
-        # Build lookup dictionary: list_id -> list_name
         lookup = {}
         for _, row in lists_df.iterrows():
-            list_id = str(row[id_col]) if pd.notna(row[id_col]) else None
+            list_id = str(row["listId"]) if pd.notna(row["listId"]) else None
             list_name = str(row["name"]) if pd.notna(row["name"]) else None
             if list_id and list_name:
                 lookup[list_id] = list_name
@@ -432,7 +423,6 @@ class HubSpotHandler(BaseETLHandler):
 
         df = df.copy()
 
-        # Check if _hg_list_memberships exists
         if "_hg_list_memberships" not in df.columns:
             logger.debug("No _hg_list_memberships field found")
             df["crmListMembershipDetails"] = None
@@ -443,12 +433,10 @@ class HubSpotHandler(BaseETLHandler):
             if pd.isna(list_memberships) or list_memberships is None:
                 return None
 
-            # Handle different formats: could be a list, comma-separated string, or JSON
             list_ids = []
             if isinstance(list_memberships, list):
                 list_ids = [str(lid) for lid in list_memberships if lid is not None]
             elif isinstance(list_memberships, str):
-                # Try to parse as JSON first
                 try:
                     import json
                     parsed = json.loads(list_memberships)
@@ -457,7 +445,6 @@ class HubSpotHandler(BaseETLHandler):
                     else:
                         list_ids = [str(list_memberships)]
                 except (json.JSONDecodeError, TypeError):
-                    # Treat as comma-separated or single value
                     list_ids = [lid.strip() for lid in str(list_memberships).split(",") if lid.strip()]
             else:
                 list_ids = [str(list_memberships)]
@@ -465,7 +452,6 @@ class HubSpotHandler(BaseETLHandler):
             if not list_ids:
                 return None
 
-            # Build the membership details list
             details = []
             for lid in list_ids:
                 name = list_lookup.get(lid, "") if list_lookup else ""
@@ -474,11 +460,8 @@ class HubSpotHandler(BaseETLHandler):
             return details if details else None
 
         df["crmListMembershipDetails"] = df["_hg_list_memberships"].apply(build_membership_details)
-
-        # Drop the helper column
         df = df.drop(columns=["_hg_list_memberships"], errors="ignore")
 
-        # Log stats
         non_null_count = df["crmListMembershipDetails"].notna().sum()
         logger.info(f"Populated crmListMembershipDetails for {non_null_count} records")
 
