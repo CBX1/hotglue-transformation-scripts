@@ -186,9 +186,10 @@ class HubSpotHandler(BaseETLHandler):
         # Write to output
         self.write_to_singer(df_out, self.stream_name_mapping[mapping_name])
         logger.info(f"Processed {len(df_out)} contact records for HubSpot")
-                
-        # This checks the raw source data for globalUnsubscribe field
-        self._handle_global_unsubscribe(contacts_df_raw)
+
+        # DISABLED: Do not mark contacts as unsubscribed on HubSpot
+        # This was syncing globalUnsubscribe from Salesforce to HubSpot communication preferences
+        # self._handle_global_unsubscribe(contacts_df_raw)
     
     def _handle_global_unsubscribe(self, contacts_df: pd.DataFrame) -> None:
         """
