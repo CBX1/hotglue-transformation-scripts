@@ -291,46 +291,20 @@ class HubSpotHandler(BaseETLHandler):
 
         The CRM Sync Approval System (CB-7840/PR #3053) gates critical field changes
         before syncing to external CRMs. This method filters out contacts where:
-        1. The field value is false/empty (no sync needed)
-        2. The field is in pendingCriticalFieldsForCrmSync (awaiting approval)
-        3. The contact has a rejectionReason set (change was rejected)
+        1. The field is in pendingCriticalFieldsForCrmSync (awaiting approval)
+        2. The contact has a rejectionReason set (change was rejected)
+
+        Note: Callers should pre-filter for truthy field values before calling this method.
 
         Args:
-            df: DataFrame of contacts to filter
+            df: DataFrame of contacts to filter (should already be filtered for field=true)
             field_name: The field name to check (e.g., "globalUnsubscribe")
 
         Returns:
-            DataFrame with contacts that should not be synced removed
+            DataFrame with contacts pending approval or rejected removed
         """
         if df is None or df.empty:
             return df
-
-        # Optimization: First filter out contacts where the field value is false/empty
-        # These don't need syncing regardless of approval status
-        if field_name in df.columns:
-            def is_truthy(value) -> bool:
-                if value is None:
-                    return False
-                if isinstance(value, bool):
-                    return value
-                if isinstance(value, (int, float)):
-                    if pd.isna(value):
-                        return False
-                    return bool(value)
-                if isinstance(value, str):
-                    return value.strip().lower() in ("true", "1")
-                return False
-
-            truthy_mask = df[field_name].apply(is_truthy)
-            false_count = (~truthy_mask).sum()
-            if false_count > 0:
-                logger.debug(
-                    f"Skipped {false_count} contacts with '{field_name}'=false (no sync needed)"
-                )
-            df = df[truthy_mask].copy()
-
-            if df.empty:
-                return df
 
         pending_field_col = "pendingCriticalFieldsForCrmSync"
         rejection_reason_col = "rejectionReason"
