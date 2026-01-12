@@ -187,7 +187,9 @@ class HubSpotHandler(BaseETLHandler):
         self.write_to_singer(df_out, self.stream_name_mapping[mapping_name])
         logger.info(f"Processed {len(df_out)} contact records for HubSpot")
                 
-        # This checks the raw source data for globalUnsubscribe field
+        # Call unsubscribe API for contacts with globalUnsubscribe=true
+        # Only processes contacts where globalUnsubscribe is NOT pending approval or rejected
+        # (CB-7840: CRM Sync Approval System gates critical field changes)
         self._handle_global_unsubscribe(contacts_df_raw)
     
     def _handle_global_unsubscribe(self, contacts_df: pd.DataFrame) -> None:
@@ -219,7 +221,13 @@ class HubSpotHandler(BaseETLHandler):
             unsubscribe_mask = unsubscribe_mask.astype(bool)
         
         contacts_to_unsubscribe = contacts_df[unsubscribe_mask].copy()
-        
+
+        # Filter out contacts where globalUnsubscribe is pending approval or was rejected
+        # (CB-7840: CRM Sync Approval System gates critical field changes)
+        contacts_to_unsubscribe = self._filter_pending_or_rejected_contacts(
+            contacts_to_unsubscribe, "globalUnsubscribe"
+        )
+
         if contacts_to_unsubscribe.empty:
             logger.info("No contacts with globalUnsubscribe=true found")
             return
@@ -274,7 +282,118 @@ class HubSpotHandler(BaseETLHandler):
             f"Successfully queued {len(emails_to_unsubscribe)} contacts for global unsubscribe "
             "via individual API calls"
         )
-    
+
+    def _filter_pending_or_rejected_contacts(
+        self, df: pd.DataFrame, field_name: str
+    ) -> pd.DataFrame:
+        """
+        Filter out contacts where a specific field is pending CRM sync approval or was rejected.
+
+        The CRM Sync Approval System (CB-7840/PR #3053) gates critical field changes
+        before syncing to external CRMs. This method filters out contacts where:
+        1. The field is in pendingCriticalFieldsForCrmSync (awaiting approval)
+        2. The contact has a rejectionReason set (change was rejected)
+
+        Note: Callers should pre-filter for truthy field values before calling this method.
+
+        Args:
+            df: DataFrame of contacts to filter (should already be filtered for field=true)
+            field_name: The field name to check (e.g., "globalUnsubscribe")
+
+        Returns:
+            DataFrame with contacts pending approval or rejected removed
+        """
+        if df is None or df.empty:
+            return df
+
+        pending_field_col = "pendingCriticalFieldsForCrmSync"
+        rejection_reason_col = "rejectionReason"
+
+        # Check if approval system columns exist (backward compatibility)
+        has_pending_col = pending_field_col in df.columns
+        has_rejection_col = rejection_reason_col in df.columns
+
+        if not has_pending_col and not has_rejection_col:
+            logger.debug(
+                "CRM sync approval columns not found in data; "
+                "proceeding with all contacts (pre-approval system data)"
+            )
+            return df
+
+        def is_not_pending_approval(pending_fields) -> bool:
+            """Check if the field is NOT in the pending approval list."""
+            # Handle null/NA values - not pending
+            if pending_fields is None:
+                return True
+            if isinstance(pending_fields, float) and pd.isna(pending_fields):
+                return True
+
+            # Handle list type
+            if isinstance(pending_fields, list):
+                return field_name not in pending_fields
+
+            # Handle string type (could be JSON string or comma-separated)
+            if isinstance(pending_fields, str):
+                pending_str = pending_fields.strip()
+                if not pending_str or pending_str.lower() in ("null", "none", "[]"):
+                    return True
+
+                # Try JSON parsing first
+                if pending_str.startswith("["):
+                    try:
+                        import json
+                        fields_list = json.loads(pending_str)
+                        return field_name not in fields_list
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+
+                # Fallback: check if field name is in the string
+                return field_name not in pending_str
+
+            # Default: not pending (unknown type)
+            return True
+
+        def has_no_rejection_reason(rejection_reason) -> bool:
+            """Check if there is no rejection reason set."""
+            if rejection_reason is None:
+                return True
+            if isinstance(rejection_reason, float) and pd.isna(rejection_reason):
+                return True
+            if isinstance(rejection_reason, str):
+                return not rejection_reason.strip() or rejection_reason.strip().lower() in ("null", "none")
+            return True
+
+        original_count = len(df)
+
+        # Build mask for contacts that should be synced
+        # (not pending AND no rejection reason)
+        if has_pending_col:
+            not_pending_mask = df[pending_field_col].apply(is_not_pending_approval)
+        else:
+            not_pending_mask = pd.Series([True] * len(df), index=df.index)
+
+        if has_rejection_col:
+            not_rejected_mask = df[rejection_reason_col].apply(has_no_rejection_reason)
+        else:
+            not_rejected_mask = pd.Series([True] * len(df), index=df.index)
+
+        # Combine masks: must pass BOTH checks
+        should_sync_mask = not_pending_mask & not_rejected_mask
+        filtered_df = df[should_sync_mask].copy()
+
+        # Log details about what was filtered
+        pending_count = (~not_pending_mask).sum() if has_pending_col else 0
+        rejected_count = (~not_rejected_mask).sum() if has_rejection_col else 0
+        total_skipped = original_count - len(filtered_df)
+
+        if total_skipped > 0:
+            logger.info(
+                f"Skipped {total_skipped} contacts for '{field_name}' sync: "
+                f"{pending_count} pending approval, {rejected_count} rejected"
+            )
+
+        return filtered_df
+
     def handle_read(self) -> None:
         """
         Handle the read operation for HubSpot data.
