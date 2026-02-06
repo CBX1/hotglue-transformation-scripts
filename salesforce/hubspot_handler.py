@@ -775,14 +775,21 @@ class HubSpotHandler(BaseETLHandler):
             logger.warning(f"Missing '{lookup_field}' field in {stream}, cannot wrap records")
             return df
 
+        # Replace pandas NaT and NA with None for JSON serialization
+        df = df.copy()
+        df = df.replace({pd.NaT: None, pd.NA: None})
+
         # Convert DataFrame to list of dictionaries
         records = df.to_dict(orient='records')
 
         # Wrap each record
         wrapped_records = []
         for record in records:
+            # Clean the record data recursively
+            cleaned_record = self._clean_record_for_serialization(record)
+
             wrapped = {
-                "data": record.copy(),
+                "data": cleaned_record,
                 "lookupKey": record.get(lookup_field),
                 "sourceRecordId": record.get("id")
             }
@@ -793,3 +800,28 @@ class HubSpotHandler(BaseETLHandler):
 
         logger.info(f"Wrapped {len(wrapped_df)} {stream} records with metadata structure")
         return wrapped_df
+
+    def _clean_record_for_serialization(self, obj):
+        """
+        Recursively clean a record by converting pandas NaT/NA and numpy types to JSON-serializable values.
+
+        Args:
+            obj: Object to clean (can be dict, list, or scalar)
+
+        Returns:
+            Cleaned object safe for JSON serialization
+        """
+        if isinstance(obj, dict):
+            return {k: self._clean_record_for_serialization(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [self._clean_record_for_serialization(item) for item in obj]
+        elif pd.isna(obj):
+            # Handles pd.NaT, pd.NA, np.nan, None
+            return None
+        elif isinstance(obj, (np.integer, np.floating)):
+            # Convert numpy types to Python native types
+            return obj.item()
+        elif isinstance(obj, np.bool_):
+            return bool(obj)
+        else:
+            return obj
