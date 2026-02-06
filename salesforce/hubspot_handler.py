@@ -435,6 +435,9 @@ class HubSpotHandler(BaseETLHandler):
             if stream == "contacts":
                 stream_data = self._enrich_with_account_id(stream_data)
 
+            # Wrap records in {data, lookupKey, sourceRecordId} structure
+            stream_data = self._wrap_records_with_metadata(stream_data, stream)
+
             # Determine output stream name
             inverse_mapping = {v: k for k, v in self.stream_name_mapping.items()}
             output_stream = inverse_mapping.get(stream, stream)
@@ -729,3 +732,64 @@ class HubSpotHandler(BaseETLHandler):
         logger.info(f"Enriched {non_null_count} contacts with df_accountId")
 
         return merged
+
+    def _wrap_records_with_metadata(self, df: pd.DataFrame, stream: str) -> pd.DataFrame:
+        """
+        Wrap each record in a structure with data, lookupKey, and sourceRecordId.
+
+        Transforms each record from:
+        {field1: value1, field2: value2, ...}
+
+        To:
+        {
+            data: {field1: value1, field2: value2, ...},
+            lookupKey: <email for contacts, domain for companies>,
+            sourceRecordId: <id>
+        }
+
+        Args:
+            df: DataFrame to wrap
+            stream: Stream name (contacts or companies)
+
+        Returns:
+            DataFrame with wrapped records
+        """
+        if df is None or df.empty:
+            return df
+
+        # Determine lookup key field based on stream
+        if stream == "contacts":
+            lookup_field = "email"
+        elif stream == "companies":
+            lookup_field = "domain"
+        else:
+            logger.warning(f"Unknown stream '{stream}' for record wrapping")
+            return df
+
+        # Check if required fields exist
+        if "id" not in df.columns:
+            logger.warning(f"Missing 'id' field in {stream}, cannot wrap records")
+            return df
+
+        if lookup_field not in df.columns:
+            logger.warning(f"Missing '{lookup_field}' field in {stream}, cannot wrap records")
+            return df
+
+        # Convert DataFrame to list of dictionaries
+        records = df.to_dict(orient='records')
+
+        # Wrap each record
+        wrapped_records = []
+        for record in records:
+            wrapped = {
+                "data": record.copy(),
+                "lookupKey": record.get(lookup_field),
+                "sourceRecordId": record.get("id")
+            }
+            wrapped_records.append(wrapped)
+
+        # Convert back to DataFrame
+        wrapped_df = pd.DataFrame(wrapped_records)
+
+        logger.info(f"Wrapped {len(wrapped_df)} {stream} records with metadata structure")
+        return wrapped_df
