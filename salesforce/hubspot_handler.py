@@ -397,27 +397,335 @@ class HubSpotHandler(BaseETLHandler):
     def handle_read(self) -> None:
         """
         Handle the read operation for HubSpot data.
-        
-        This method passes through HubSpot data as-is without transformations,
-        preserving all native HubSpot field names and values.
+
+        This method:
+        1. Passes through raw HubSpot fields as-is (no heavy normalization)
+        2. Enriches with context needed by Different:
+           - Owner details (from owners stream)
+           - List membership details (from _hg_list_memberships + lists stream)
+           - df_accountId (from snapshots for contacts)
         """
-        logger.info("Starting HubSpot read operation (passthrough mode)")
-        
+        logger.info("Starting HubSpot read operation (passthrough + context enrichment)")
+
         data_streams = self.list_available_streams()
         if not data_streams:
             logger.warning("No streams available for read operation")
             return
-        
+
+        # Prepare owner lookup for enrichment
+        owner_lookup = self._prepare_owner_lookup(data_streams)
+
+        # Prepare list lookup for membership enrichment
+        list_lookup = self._prepare_list_lookup(data_streams)
+
         # Only process relevant streams for data warehouse
         target_streams = [s for s in data_streams if s in {"contacts", "companies"}]
-        
+
         for stream in target_streams:
-            logger.info(f"Processing read stream (passthrough): {stream}")
+            logger.info(f"Processing read stream (passthrough + enrichment): {stream}")
             stream_data = self.get_stream_data(stream)
-            
+
+            # Enrich with owner context
+            stream_data = self._enrich_with_owner_details(stream_data, stream, owner_lookup)
+
+            # Enrich with list membership context
+            stream_data = self._enrich_with_membership_details(stream_data, stream, list_lookup)
+
+            # For contacts: add df_accountId from snapshots
+            if stream == "contacts":
+                stream_data = self._enrich_with_account_id(stream_data)
+
             # Determine output stream name
             inverse_mapping = {v: k for k, v in self.stream_name_mapping.items()}
             output_stream = inverse_mapping.get(stream, stream)
-            
+
             self.write_to_singer(stream_data, output_stream)
             logger.info(f"Wrote {len(stream_data)} records for read stream: {stream}")
+
+    def _prepare_owner_lookup(self, streams: List[str]) -> Optional[pd.DataFrame]:
+        """
+        Create a lookup table for HubSpot owner information enrichment.
+
+        Args:
+            streams: List of available stream names
+
+        Returns:
+            DataFrame with owner lookup information or None if not available
+        """
+        if "owners" not in streams:
+            logger.info("No owners stream available for enrichment")
+            return None
+
+        owners_df = self.get_stream_data("owners")
+        if owners_df is None or owners_df.empty:
+            logger.info("Owners stream is empty")
+            return None
+
+        if "id" not in owners_df.columns:
+            logger.warning("Owners stream missing 'id' column")
+            return None
+
+        length = len(owners_df)
+
+        # Helper function to create string series with proper NA handling
+        def _string_series(column: str) -> pd.Series:
+            if column not in owners_df.columns:
+                return pd.Series([pd.NA] * length, dtype="string")
+            return owners_df[column].astype("string")
+
+        # Extract owner information
+        first_name = _string_series("firstName").fillna("")
+        last_name = _string_series("lastName").fillna("")
+        email = _string_series("email")
+
+        # Construct full name
+        full_name = (first_name.str.strip() + " " + last_name.str.strip()).str.strip()
+        full_name = full_name.mask(full_name == "", pd.NA)
+        full_name = full_name.fillna(email)
+
+        # Create lookup DataFrame
+        lookup = pd.DataFrame({
+            "owner_key": owners_df["id"].astype("string"),
+            "owner_name": full_name,
+            "owner_email": email,
+        })
+
+        logger.info(f"Created owner lookup with {len(lookup)} entries")
+        return lookup
+
+    def _prepare_list_lookup(self, streams: List[str]) -> Optional[Dict[str, str]]:
+        """
+        Create a lookup dictionary for HubSpot list information.
+
+        Maps list IDs to list names from the 'lists' stream.
+
+        Args:
+            streams: List of available stream names
+
+        Returns:
+            Dictionary mapping list ID (string) to list name, or None if not available
+        """
+        if "lists" not in streams:
+            logger.info("No lists stream available for list membership enrichment")
+            return None
+
+        lists_df = self.get_stream_data("lists")
+        if lists_df is None or lists_df.empty:
+            logger.info("Lists stream is empty")
+            return None
+
+        if "listId" not in lists_df.columns:
+            logger.warning("Lists stream missing 'listId' column")
+            return None
+
+        if "name" not in lists_df.columns:
+            logger.warning("Lists stream missing 'name' column")
+            return None
+
+        lookup = {}
+        for _, row in lists_df.iterrows():
+            list_id = str(row["listId"]) if pd.notna(row["listId"]) else None
+            list_name = str(row["name"]) if pd.notna(row["name"]) else None
+            if list_id and list_name:
+                lookup[list_id] = list_name
+
+        logger.info(f"Created list lookup with {len(lookup)} entries")
+        return lookup
+
+    def _enrich_with_owner_details(
+        self,
+        df: pd.DataFrame,
+        stream: str,
+        owner_lookup: Optional[pd.DataFrame]
+    ) -> pd.DataFrame:
+        """
+        Enrich data with owner details as a nested object.
+
+        Adds ownerDetails field with structure:
+        {
+            "name": "Owner Name",
+            "email": "owner@example.com"
+        }
+
+        Args:
+            df: DataFrame to enrich
+            stream: Stream name (contacts or companies)
+            owner_lookup: Owner lookup DataFrame
+
+        Returns:
+            DataFrame with ownerDetails field added
+        """
+        if df is None or df.empty:
+            return df
+
+        df = df.copy()
+
+        # Check if hubspot_owner_id field exists
+        if "hubspot_owner_id" not in df.columns:
+            logger.debug(f"No hubspot_owner_id field in {stream}, skipping owner enrichment")
+            df["ownerDetails"] = None
+            return df
+
+        if owner_lookup is None or owner_lookup.empty:
+            logger.debug(f"No owner lookup available for {stream}")
+            df["ownerDetails"] = None
+            return df
+
+        # Merge with owner lookup
+        df["__owner_key"] = df["hubspot_owner_id"].astype("string")
+        merged = df.merge(
+            owner_lookup,
+            how="left",
+            left_on="__owner_key",
+            right_on="owner_key"
+        )
+
+        # Build ownerDetails object
+        def build_owner_details(row):
+            """Build owner details object from row data."""
+            name = row.get("owner_name")
+            email = row.get("owner_email")
+
+            # Only create object if we have at least one value
+            if pd.notna(name) or pd.notna(email):
+                details = {}
+                if pd.notna(name):
+                    details["name"] = str(name)
+                if pd.notna(email):
+                    details["email"] = str(email)
+                return details if details else None
+            return None
+
+        merged["ownerDetails"] = merged.apply(build_owner_details, axis=1)
+
+        # Clean up temporary columns
+        merged = merged.drop(columns=["__owner_key", "owner_key", "owner_name", "owner_email"], errors="ignore")
+
+        non_null_count = merged["ownerDetails"].notna().sum()
+        logger.info(f"Enriched {non_null_count} {stream} records with owner details")
+
+        return merged
+
+    def _enrich_with_membership_details(
+        self,
+        df: pd.DataFrame,
+        stream: str,
+        list_lookup: Optional[Dict[str, str]]
+    ) -> pd.DataFrame:
+        """
+        Enrich data with list membership details from _hg_list_memberships field.
+
+        Adds membershipListDetails field with structure:
+        [
+            {"id": "123", "name": "List Name"},
+            ...
+        ]
+
+        Args:
+            df: DataFrame to enrich
+            stream: Stream name (contacts or companies)
+            list_lookup: Dictionary mapping list ID to list name
+
+        Returns:
+            DataFrame with membershipListDetails field added
+        """
+        if df is None or df.empty:
+            return df
+
+        df = df.copy()
+
+        if "_hg_list_memberships" not in df.columns:
+            logger.debug(f"No _hg_list_memberships field in {stream}")
+            df["membershipListDetails"] = None
+            return df
+
+        def build_membership_details(list_memberships):
+            """Convert list IDs to list of {id, name} objects."""
+            if pd.isna(list_memberships) or list_memberships is None:
+                return None
+
+            list_ids = []
+            if isinstance(list_memberships, list):
+                list_ids = [str(lid) for lid in list_memberships if lid is not None]
+            elif isinstance(list_memberships, str):
+                try:
+                    import json
+                    parsed = json.loads(list_memberships)
+                    if isinstance(parsed, list):
+                        list_ids = [str(lid) for lid in parsed if lid is not None]
+                    else:
+                        list_ids = [str(list_memberships)]
+                except (json.JSONDecodeError, TypeError):
+                    list_ids = [lid.strip() for lid in str(list_memberships).split(",") if lid.strip()]
+            else:
+                list_ids = [str(list_memberships)]
+
+            if not list_ids:
+                return None
+
+            details = []
+            for lid in list_ids:
+                name = list_lookup.get(lid, "") if list_lookup else ""
+                details.append({"id": lid, "name": name})
+
+            return details if details else None
+
+        df["membershipListDetails"] = df["_hg_list_memberships"].apply(build_membership_details)
+
+        non_null_count = df["membershipListDetails"].notna().sum()
+        logger.info(f"Enriched {non_null_count} {stream} records with membership list details")
+
+        return df
+
+    def _enrich_with_account_id(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        For HubSpot contacts, add df_accountId by mapping associatedcompanyid to
+        CBX1 company ID using the companies snapshot.
+
+        Mapping logic:
+        - associatedcompanyid (HubSpot company remote id) -> match to companies snapshot RemoteId
+        - df_accountId output field <- companies snapshot InputId (CBX1 id)
+
+        If no snapshot or no match, df_accountId will be null.
+
+        Args:
+            df: Contacts DataFrame
+
+        Returns:
+            DataFrame with df_accountId field added
+        """
+        if df is None or df.empty:
+            return df
+
+        df = df.copy()
+
+        if "associatedcompanyid" not in df.columns:
+            logger.debug("No associatedcompanyid field in contacts, skipping account enrichment")
+            df["df_accountId"] = None
+            return df
+
+        # Read companies snapshot (stores InputId and RemoteId)
+        companies_snap = self.read_snapshot("companies")
+        if companies_snap is None or companies_snap.empty:
+            logger.info("No companies snapshot available for account ID enrichment")
+            df["df_accountId"] = None
+            return df
+
+        # Prepare for join
+        tmp = companies_snap.rename(columns={"RemoteId": "__company_remote_id", "InputId": "df_accountId"}).copy()
+        # Normalize types for safe join
+        df["associatedcompanyid"] = df["associatedcompanyid"].astype("string")
+        tmp["__company_remote_id"] = tmp["__company_remote_id"].astype("string")
+
+        merged = df.merge(
+            tmp[["__company_remote_id", "df_accountId"]],
+            left_on="associatedcompanyid",
+            right_on="__company_remote_id",
+            how="left",
+        )
+        merged = merged.drop(columns=["__company_remote_id"], errors="ignore")
+
+        non_null_count = merged["df_accountId"].notna().sum()
+        logger.info(f"Enriched {non_null_count} contacts with df_accountId")
+
+        return merged
