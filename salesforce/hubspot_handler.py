@@ -735,7 +735,7 @@ class HubSpotHandler(BaseETLHandler):
 
     def _wrap_records_with_metadata(self, df: pd.DataFrame, stream: str) -> pd.DataFrame:
         """
-        Wrap each record in a structure with data, lookupKey, and sourceRecordId.
+        Wrap each record in a structure with data, lookupKey, sourceRecordId, and source.
 
         Transforms each record from:
         {field1: value1, field2: value2, ...}
@@ -743,9 +743,12 @@ class HubSpotHandler(BaseETLHandler):
         To:
         {
             data: {field1: value1, field2: value2, ...},
-            lookupKey: <email for contacts, domain for companies>,
-            sourceRecordId: <id>
+            sourceRecordId: <id>,
+            source: 'HUBSPOT',
+            lookupKey: <email for contacts, domain for companies>
         }
+
+        Records with null lookupKey values are filtered out.
 
         Args:
             df: DataFrame to wrap
@@ -775,8 +778,20 @@ class HubSpotHandler(BaseETLHandler):
             logger.warning(f"Missing '{lookup_field}' field in {stream}, cannot wrap records")
             return df
 
-        # Replace pandas NaT and NA with None for JSON serialization
+        # Filter out records with null lookup key (email or domain)
         df = df.copy()
+        initial_count = len(df)
+        df = df[df[lookup_field].notna() & (df[lookup_field].astype(str).str.strip() != "")]
+        filtered_count = initial_count - len(df)
+
+        if filtered_count > 0:
+            logger.info(f"Filtered out {filtered_count} {stream} records with null or empty {lookup_field}")
+
+        if df.empty:
+            logger.warning(f"All {stream} records filtered out due to null {lookup_field}")
+            return df
+
+        # Replace pandas NaT and NA with None for JSON serialization
         df = df.replace({pd.NaT: None, pd.NA: None})
 
         # Convert DataFrame to list of dictionaries
@@ -790,15 +805,16 @@ class HubSpotHandler(BaseETLHandler):
 
             wrapped = {
                 "data": cleaned_record,
-                "lookupKey": record.get(lookup_field),
-                "sourceRecordId": record.get("id")
+                "sourceRecordId": record.get("id"),
+                "source": "HUBSPOT",
+                "lookupKey": record.get(lookup_field)
             }
             wrapped_records.append(wrapped)
 
         # Convert back to DataFrame
         wrapped_df = pd.DataFrame(wrapped_records)
 
-        logger.info(f"Wrapped {len(wrapped_df)} {stream} records with metadata structure")
+        logger.info(f"Wrapped {len(wrapped_df)} {stream} records with metadata structure and source='HUBSPOT'")
         return wrapped_df
 
     def _clean_record_for_serialization(self, obj):
