@@ -428,12 +428,9 @@ class HubSpotHandler(BaseETLHandler):
             stream_data = self._filter_archived_records(stream_data, stream)
             owner_column = None
 
-            if stream not in mapping:
-                logger.info(f"No mapping for stream {stream}, passing through")
-            else:
-                # Apply field mapping and transformations
-                stream_data, owner_column = self._apply_read_mapping(
-                    stream_data, stream, mapping[stream]
+          
+            stream_data, owner_column = self._apply_read_mapping(
+                    stream_data, stream
                 )   
 
             # Enrich with owner information for contacts and companies
@@ -639,7 +636,6 @@ class HubSpotHandler(BaseETLHandler):
         self,
         df: pd.DataFrame,
         stream: str,
-        mapping: Dict
     ) -> tuple[pd.DataFrame, Optional[str]]:
         """
         Apply read mapping to transform field names.
@@ -655,45 +651,29 @@ class HubSpotHandler(BaseETLHandler):
         df = df.copy()
         owner_column = None
         
-        connector_columns = list(mapping.keys())
-        target_api_columns = list(mapping.values())
-        
-        # Rename columns based on mapping
-        columns_to_rename = [c for c in df.columns if c in target_api_columns]
-        gc = np.array(target_api_columns)
-        
-        for column in columns_to_rename:
-            for ind in np.where(gc == column)[0]:
-                df[connector_columns[ind]] = df[column]
-        
-        # Build list of columns to keep
-        cols = [c for c in connector_columns if c in df.columns]
-        if "remote_id" in df.columns:
-            cols.append("remote_id")
-        
         # Check for owner column
         if "hubspot_owner_id" in df.columns:
             owner_column = "hubspot_owner_id"
-            if owner_column not in cols:
-                cols.append(owner_column)
+        else:
+            # Add hubspot_owner_id column if not present
+            df["hubspot_owner_id"] = None
 
         # Preserve associatedcompanyid for contacts so we can derive accountId later
-        if stream == "contacts" and "associatedcompanyid" in df.columns:
-            cols.append("associatedcompanyid")
-        # Preserve is_public for companies so we can derive ownershipType later
-        if stream == "companies" and "is_public" in df.columns:
-            cols.append("is_public")
-        # Preserve _hg_list_memberships for list membership enrichment
-        if stream in {"contacts", "companies"} and "_hg_list_memberships" in df.columns:
-            cols.append("_hg_list_memberships")
+        if stream == "contacts":
+            if "associatedcompanyid" not in df.columns:
+                df["associatedcompanyid"] = None
 
-        # Ensure unique columns
-        unique_cols = []
-        for col in cols:
-            if col not in unique_cols:
-                unique_cols.append(col)
+        # Preserve is_public for companies so we can derive ownershipType later
+        if stream == "companies":
+            if "is_public" not in df.columns:
+                df["is_public"] = None
+
+        # Preserve _hg_list_memberships for list membership enrichment
+        if stream in {"contacts", "companies"}:
+            if "_hg_list_memberships" not in df.columns:
+                df["_hg_list_memberships"] = None
         
-        return df[unique_cols].copy(), owner_column
+        return df, owner_column
 
     def _wrap_records_with_metadata(self, df: pd.DataFrame, stream: str) -> pd.DataFrame:
         """
