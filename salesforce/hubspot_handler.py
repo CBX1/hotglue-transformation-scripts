@@ -399,14 +399,13 @@ class HubSpotHandler(BaseETLHandler):
         Handle the read operation for HubSpot data.
 
         This method:
-        1. Reads data from HubSpot format
-        2. Enriches with owner information when available
-        3. Transforms to standardized data warehouse format
-        4. Adds CBX1 IDs where available
-        5. For contacts, adds accountId by mapping associatedcompanyid -> CBX1 company id
-        6. Populates crmListMembershipDetails from _hg_list_memberships
+        1. Passes through raw HubSpot fields as-is (no heavy normalization)
+        2. Enriches with context needed by Different:
+           - Owner details (from owners stream)
+           - List membership details (from _hg_list_memberships + lists stream)
+           - df_accountId (from snapshots for contacts)
         """
-        logger.info("Starting HubSpot read operation")
+        logger.info("Starting HubSpot read operation (passthrough + context enrichment)")
 
         data_streams = self.list_available_streams()
         if not data_streams or not self.mapping_for_flow:
@@ -414,7 +413,6 @@ class HubSpotHandler(BaseETLHandler):
             return
 
         mapping = self.build_read_mapping()
-
         # Prepare owner lookup for enrichment
         owner_lookup = self._prepare_owner_lookup(data_streams)
 
@@ -425,57 +423,82 @@ class HubSpotHandler(BaseETLHandler):
         target_streams = [s for s in data_streams if s in {"contacts", "companies"}]
 
         for stream in target_streams:
-            self._process_read_stream(stream, mapping, owner_lookup, list_lookup)
-    
+            logger.info(f"Processing read stream (passthrough + enrichment): {stream}")
+            stream_data = self.get_stream_data(stream)
+            stream_data = self._filter_archived_records(stream_data, stream)
+            owner_column = None
+
+          
+            stream_data, owner_column = self._apply_read_mapping(
+                    stream_data, stream
+                )   
+
+            # Enrich with owner information for contacts and companies
+            if stream in {"contacts", "companies"}:
+                stream_data = self._merge_owner_details(stream_data, owner_lookup, owner_column)
+            
+
+            # Enrich with list membership context
+            stream_data = self._populate_list_memberships(stream_data, stream, list_lookup)
+            # Wrap records in {data, lookupKey, sourceRecordId} structure
+            stream_data = self._wrap_records_with_metadata(stream_data, stream)
+
+            # Determine output stream name
+            inverse_mapping = {v: k for k, v in self.stream_name_mapping.items()}
+            output_stream = inverse_mapping.get(stream, stream)
+
+            self.write_to_singer(stream_data, output_stream)
+            logger.info(f"Wrote {len(stream_data)} records for read stream: {stream}")
+
     def _prepare_owner_lookup(self, streams: List[str]) -> Optional[pd.DataFrame]:
         """
         Create a lookup table for HubSpot owner information enrichment.
-        
+
         Args:
             streams: List of available stream names
-            
+
         Returns:
             DataFrame with owner lookup information or None if not available
         """
         if "owners" not in streams:
             logger.info("No owners stream available for enrichment")
             return None
-        
+
         owners_df = self.get_stream_data("owners")
         owners_df = self._filter_archived_records(owners_df, "owners")
         if owners_df is None or owners_df.empty:
             logger.info("Owners stream is empty")
             return None
-        
+
         if "id" not in owners_df.columns:
             logger.warning("Owners stream missing 'id' column")
             return None
-        
+
         length = len(owners_df)
-        
+
         # Helper function to create string series with proper NA handling
         def _string_series(column: str) -> pd.Series:
             if column not in owners_df.columns:
                 return pd.Series([pd.NA] * length, dtype="string")
             return owners_df[column].astype("string")
-        
+
         # Extract owner information
         first_name = _string_series("firstName").fillna("")
         last_name = _string_series("lastName").fillna("")
         email = _string_series("email")
-        
+
         # Construct full name
         full_name = (first_name.str.strip() + " " + last_name.str.strip()).str.strip()
         full_name = full_name.mask(full_name == "", pd.NA)
         full_name = full_name.fillna(email)
-        
+
         # Create lookup DataFrame
         lookup = pd.DataFrame({
             "owner_key": owners_df["id"].astype("string"),
             "crmOwnerName": full_name,
             "crmOwnerEmail": email,
         })
-        
+
         logger.info(f"Created owner lookup with {len(lookup)} entries")
         return lookup
 
@@ -518,9 +541,11 @@ class HubSpotHandler(BaseETLHandler):
         logger.info(f"Created list lookup with {len(lookup)} entries")
         return lookup
 
+
     def _populate_list_memberships(
         self,
         df: pd.DataFrame,
+        stream: str,
         list_lookup: Optional[Dict[str, str]]
     ) -> pd.DataFrame:
         """
@@ -585,68 +610,7 @@ class HubSpotHandler(BaseETLHandler):
         logger.info(f"Populated crmListMembershipDetails for {non_null_count} records")
 
         return df
-
-    def _process_read_stream(
-        self,
-        stream: str,
-        mapping: Dict,
-        owner_lookup: Optional[pd.DataFrame],
-        list_lookup: Optional[Dict[str, str]] = None
-    ) -> None:
-        """
-        Process a single stream for read operation.
-
-        Args:
-            stream: Name of the stream to process
-            mapping: Field mapping configuration
-            owner_lookup: Owner information lookup table
-            list_lookup: List ID to name lookup dictionary
-        """
-        logger.info(f"Processing read stream: {stream}")
-
-        stream_data = self.get_stream_data(stream)
-        stream_data = self._filter_archived_records(stream_data, stream)
-        owner_column = None
-
-        if stream not in mapping:
-            logger.info(f"No mapping for stream {stream}, passing through")
-        else:
-            # Apply field mapping and transformations
-            stream_data, owner_column = self._apply_read_mapping(
-                stream_data, stream, mapping[stream]
-            )
-
-            # Enrich with CBX1 IDs from snapshots
-            stream_data = self._enrich_with_cbx1_ids(stream_data, stream)
-
-        # Enrich with owner information for contacts and companies
-        if stream in {"contacts", "companies"}:
-            stream_data = self._merge_owner_details(stream_data, owner_lookup, owner_column)
-
-        # For companies: derive ownershipType from is_public
-        if stream == "companies":
-            stream_data = self._apply_company_ownership_type(stream_data)
-
-        # For contacts: post-process to attach accountId and drop helper columns
-        if stream == "contacts":
-            stream_data = self._post_process_contacts(stream_data)
-
-        # Populate CRM list membership details for contacts and companies
-        if stream in {"contacts", "companies"}:
-            stream_data = self._populate_list_memberships(stream_data, list_lookup)
-
-        # Add CRM system identifier
-        stream_data = self._add_crm_system(stream_data)
-
-        # Transform dot notation to nested structures
-        stream_data = transform_dot_notation_to_nested(stream_data)
-        
-        # Determine output stream name
-        inverse_mapping = {v: k for k, v in self.stream_name_mapping.items()}
-        output_stream = inverse_mapping.get(stream, stream)
-        
-        self._write_read_output(stream_data, output_stream)
-
+    
     def _filter_archived_records(
         self,
         df: Optional[pd.DataFrame],
@@ -666,11 +630,12 @@ class HubSpotHandler(BaseETLHandler):
             )
         return filtered_df
     
+
+
     def _apply_read_mapping(
         self,
         df: pd.DataFrame,
         stream: str,
-        mapping: Dict
     ) -> tuple[pd.DataFrame, Optional[str]]:
         """
         Apply read mapping to transform field names.
@@ -686,176 +651,140 @@ class HubSpotHandler(BaseETLHandler):
         df = df.copy()
         owner_column = None
         
-        connector_columns = list(mapping.keys())
-        target_api_columns = list(mapping.values())
-        
-        # Rename columns based on mapping
-        columns_to_rename = [c for c in df.columns if c in target_api_columns]
-        gc = np.array(target_api_columns)
-        
-        for column in columns_to_rename:
-            for ind in np.where(gc == column)[0]:
-                df[connector_columns[ind]] = df[column]
-        
-        # Build list of columns to keep
-        cols = [c for c in connector_columns if c in df.columns]
-        if "remote_id" in df.columns:
-            cols.append("remote_id")
-        
         # Check for owner column
         if "hubspot_owner_id" in df.columns:
             owner_column = "hubspot_owner_id"
-            if owner_column not in cols:
-                cols.append(owner_column)
+        else:
+            # Add hubspot_owner_id column if not present
+            df["hubspot_owner_id"] = None
 
         # Preserve associatedcompanyid for contacts so we can derive accountId later
-        if stream == "contacts" and "associatedcompanyid" in df.columns:
-            cols.append("associatedcompanyid")
+        if stream == "contacts":
+            if "associatedcompanyid" not in df.columns:
+                df["associatedcompanyid"] = None
+
         # Preserve is_public for companies so we can derive ownershipType later
-        if stream == "companies" and "is_public" in df.columns:
-            cols.append("is_public")
+        if stream == "companies":
+            if "is_public" not in df.columns:
+                df["is_public"] = None
+
         # Preserve _hg_list_memberships for list membership enrichment
-        if stream in {"contacts", "companies"} and "_hg_list_memberships" in df.columns:
-            cols.append("_hg_list_memberships")
-
-        # Ensure unique columns
-        unique_cols = []
-        for col in cols:
-            if col not in unique_cols:
-                unique_cols.append(col)
+        if stream in {"contacts", "companies"}:
+            if "_hg_list_memberships" not in df.columns:
+                df["_hg_list_memberships"] = None
         
-        return df[unique_cols].copy(), owner_column
-    
-    def _attach_contact_account_id(self, df: pd.DataFrame) -> pd.DataFrame:
+        return df, owner_column
+
+    def _wrap_records_with_metadata(self, df: pd.DataFrame, stream: str) -> pd.DataFrame:
         """
-        For HubSpot contacts, append accountId by mapping associatedcompanyid to
-        CBX1 company ID using the companies snapshot.
+        Wrap each record in a structure with data, lookupKey, sourceRecordId, and source.
 
-        Mapping logic:
-        - associatedcompanyid (HubSpot company remote id) -> match to companies snapshot RemoteId
-        - accountId output field <- companies snapshot InputId (CBX1 id)
+        Transforms each record from:
+        {field1: value1, field2: value2, ...}
 
-        If no snapshot or no match, accountId will be null.
-        """
-        if df is None or df.empty or "associatedcompanyid" not in df.columns:
-            return df
+        To:
+        {
+            data: {field1: value1, field2: value2, ...},
+            sourceRecordId: <id>,
+            source: 'HUBSPOT',
+            lookupKey: <email for contacts, domain for companies>
+        }
 
-        # Read companies snapshot (stores InputId and RemoteId)
-        companies_snap = self.read_snapshot("companies")
-        if companies_snap is None or companies_snap.empty:
-            return df
-
-        # Prepare for join
-        tmp = companies_snap.rename(columns={"RemoteId": "__company_remote_id", "InputId": "accountId"}).copy()
-        # Normalize types for safe join
-        df["associatedcompanyid"] = df["associatedcompanyid"].astype("string")
-        tmp["__company_remote_id"] = tmp["__company_remote_id"].astype("string")
-
-        merged = df.merge(
-            tmp[["__company_remote_id", "accountId"]],
-            left_on="associatedcompanyid",
-            right_on="__company_remote_id",
-            how="left",
-        )
-        merged = merged.drop(columns=["__company_remote_id"], errors="ignore")
-        return merged
-    
-    def _post_process_contacts(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Post-process contacts stream after mapping/enrichment:
-        - Attach accountId by mapping associatedcompanyid -> companies snapshot
-        - Derive emailBounceType from HubSpot email bounce fields
-        - Drop the temporary associatedcompanyid column from the final output
+        Records with null lookupKey values are filtered out.
 
         Args:
-            df: Contacts DataFrame
+            df: DataFrame to wrap
+            stream: Stream name (contacts or companies)
 
         Returns:
-            DataFrame with accountId attached, emailBounceType derived, and helper columns removed
-        """
-        df = self._attach_contact_account_id(df)
-        df = self._derive_bounce_type(df)
-        if "associatedcompanyid" in df.columns:
-            df = df.drop(columns=["associatedcompanyid"], errors="ignore")
-        return df
-
-    def _derive_bounce_type(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Derive emailBounceType field from HubSpot email bounce fields.
-
-        Maps to backend enum: ai.cbx1.targetmanagement.enums.EmailBounceType
-
-        Logic:
-            - If hs_email_hard_bounce_reason_enum is not null → HARD
-            - Else if hs_email_bounce > 0 → SOFT
-            - Else → NONE
-
-        Args:
-            df: Contacts DataFrame with HubSpot bounce fields
-
-        Returns:
-            DataFrame with emailBounceType field added
+            DataFrame with wrapped records
         """
         if df is None or df.empty:
             return df
 
-        df = df.copy()
-
-        def determine_bounce_type(row):
-            hard_bounce_reason = row.get("hs_email_hard_bounce_reason_enum")
-            email_bounce = row.get("hs_email_bounce")
-
-            # Check for hard bounce first
-            if pd.notna(hard_bounce_reason) and hard_bounce_reason not in [None, "", "null"]:
-                return "HARD"
-
-            # Check for soft bounce
-            if pd.notna(email_bounce):
-                try:
-                    if float(email_bounce) > 0:
-                        return "SOFT"
-                except (ValueError, TypeError):
-                    pass
-
-            # Return NONE to match EmailBounceType enum
-            return "NONE"
-
-        df["emailBounceType"] = df.apply(determine_bounce_type, axis=1)
-        return df
-
-    def _apply_company_ownership_type(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Derive account ownershipType from company's is_public field.
-        - If is_public is true-like -> ownershipType = "Public"
-        - Else -> ownershipType = "Private"
-
-        This expects that the `is_public` column is available after mapping for the
-        companies stream. If it is missing, defaults to Private.
-        """
-        if df is None or df.empty:
-            return df
-
-        df = df.copy()
-        # Initialize as nulls by default
-        ownership = pd.Series([pd.NA] * len(df), dtype="string")
-
-        if "is_public" in df.columns:
-            ser = df["is_public"].astype("string").str.strip().str.lower()
-            notna_mask = ~df["is_public"].isna()
-            true_mask = ser == "true"
-            false_mask = ser == "false"
-            # Assign PUBLIC/PRIVATE for explicit true/false, leave others as null
-            ownership.loc[notna_mask & true_mask] = "Public"
-            ownership.loc[notna_mask & false_mask] = "Private"
-            # Drop helper column from final output
-            df = df.drop(columns=["is_public"], errors="ignore")
+        # Determine lookup key field based on stream
+        if stream == "contacts":
+            lookup_field = "email"
+        elif stream == "companies":
+            lookup_field = "domain"
         else:
-            # If column is missing, keep ownershipType as nulls
-            logger.info("companies stream missing 'is_public' column; leaving ownershipType null")
+            logger.warning(f"Unknown stream '{stream}' for record wrapping")
+            return df
 
-        df["ownershipType"] = ownership
-        return df
-    
+        # Check if required fields exist
+        if "id" not in df.columns:
+            logger.warning(f"Missing 'id' field in {stream}, cannot wrap records")
+            return df
+
+        if lookup_field not in df.columns:
+            logger.warning(f"Missing '{lookup_field}' field in {stream}, cannot wrap records")
+            return df
+
+        # Filter out records with null lookup key (email or domain)
+        df = df.copy()
+        initial_count = len(df)
+        df = df[df[lookup_field].notna() & (df[lookup_field].astype(str).str.strip() != "")]
+        filtered_count = initial_count - len(df)
+
+        if filtered_count > 0:
+            logger.info(f"Filtered out {filtered_count} {stream} records with null or empty {lookup_field}")
+
+        if df.empty:
+            logger.warning(f"All {stream} records filtered out due to null {lookup_field}")
+            return df
+
+        # Replace pandas NaT and NA with None for JSON serialization
+        df = df.replace({pd.NaT: None, pd.NA: None})
+
+        # Convert DataFrame to list of dictionaries
+        records = df.to_dict(orient='records')
+
+        # Wrap each record
+        wrapped_records = []
+        for record in records:
+            # Clean the record data recursively
+            cleaned_record = self._clean_record_for_serialization(record)
+
+            wrapped = {
+                "data": cleaned_record,
+                "sourceRecordId": record.get("id"),
+                "source": "HUBSPOT",
+                "lookupKey": record.get(lookup_field)
+            }
+            wrapped_records.append(wrapped)
+
+        # Convert back to DataFrame
+        wrapped_df = pd.DataFrame(wrapped_records)
+
+        logger.info(f"Wrapped {len(wrapped_df)} {stream} records with metadata structure and source='HUBSPOT'")
+        return wrapped_df
+
+    def _clean_record_for_serialization(self, obj):
+        """
+        Recursively clean a record by converting pandas NaT/NA and numpy types to JSON-serializable values.
+
+        Args:
+            obj: Object to clean (can be dict, list, or scalar)
+
+        Returns:
+            Cleaned object safe for JSON serialization
+        """
+        if isinstance(obj, dict):
+            return {k: self._clean_record_for_serialization(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [self._clean_record_for_serialization(item) for item in obj]
+        elif pd.isna(obj):
+            # Handles pd.NaT, pd.NA, np.nan, None
+            return None
+        elif isinstance(obj, (np.integer, np.floating)):
+            # Convert numpy types to Python native types
+            return obj.item()
+        elif isinstance(obj, np.bool_):
+            return bool(obj)
+        else:
+            return obj
+ 
+ 
     def _merge_owner_details(
         self,
         df: pd.DataFrame,
@@ -903,51 +832,4 @@ class HubSpotHandler(BaseETLHandler):
         if "crmOwnerEmail" not in merged.columns:
             merged["crmOwnerEmail"] = pd.Series([pd.NA] * len(merged), dtype="string")
         
-        return merged
-    
-    def _enrich_with_cbx1_ids(self, df: pd.DataFrame, stream: str) -> pd.DataFrame:
-        """
-        Enrich data with CBX1 IDs from previous snapshots.
-        
-        Args:
-            df: DataFrame to enrich
-            stream: Name of the stream
-            
-        Returns:
-            DataFrame with CBX1 IDs added where available
-        """
-        if "remote_id" not in df.columns:
-            return df
-        
-        sent_data = self.read_snapshot(stream)
-        if sent_data is None:
-            return df
-        
-        sent_data = sent_data.rename(columns={"InputId": "id", "RemoteId": "remote_id"})
-        return df.merge(sent_data[["id", "remote_id"]], how="left", on="remote_id")
-    
-    def _add_crm_system(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Add CRM system identifier to the data.
-        
-        Args:
-            df: DataFrame to add CRM system to
-            
-        Returns:
-            DataFrame with crmSystem column added
-        """
-        df = df.copy()
-        df["crmSystem"] = "HUBSPOT"
-        df = df.rename(columns={"remote_id": "crmAssociationId"})
-        return df
-    
-    def _write_read_output(self, df: pd.DataFrame, stream_name: str) -> None:
-        """
-        Write the processed data for read operation.
-        
-        Args:
-            df: DataFrame to write
-            stream_name: Name of the output stream
-        """
-        self.write_to_singer(df, stream_name)
-        logger.info(f"Wrote {len(df)} records for read stream: {stream_name}")
+        return merged       
