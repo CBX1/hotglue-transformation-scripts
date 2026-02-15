@@ -151,13 +151,13 @@ class HubSpotHandler(BaseETLHandler):
         
         # Apply mapping for contacts
         mapping_name = "contacts"
-        stream_columns, contacts_df = map_stream_data(contacts_df_raw, mapping_name, mapping)
+        stream_columns=contacts_df_raw.columns
 
         # Remove HubSpot read-only fields so we never attempt to update them
         # Filter from stream_columns list
         stream_columns = [col for col in stream_columns if col not in self.READ_ONLY_FIELDS]
         # Also drop directly from DataFrame to catch any columns not tracked in stream_columns
-        contacts_df = contacts_df.drop(columns=list(self.READ_ONLY_FIELDS), errors="ignore")
+        contacts_df = contacts_df_raw.drop(columns=list(self.READ_ONLY_FIELDS), errors="ignore")
 
         new_data = contacts_df.copy()
 
