@@ -5,14 +5,14 @@
 HotGlue ETL Script - Main Entry Point
 
 This script serves as the main orchestrator for ETL operations between different CRM systems
-(Salesforce and HubSpot) and the data warehouse. It coordinates the read and write operations
-by delegating to connector-specific handlers.
+(Salesforce, HubSpot, and Marketo) and the data warehouse. It coordinates the read and write
+operations by delegating to connector-specific handlers.
 
 Environment Variables:
     ROOT_DIR: Root directory for data processing (default: ".")
     JOB_TYPE: Type of job to execute - "write" (to CRM) or "read" (from CRM) (default: "write")
     FLOW: Flow identifier for tracking and snapshot management (default: "AJ3x0LMYI")
-    CONNECTOR_ID: Identifier for the CRM connector ("salesforce" or "hubspot")
+    CONNECTOR_ID: Identifier for the CRM connector ("salesforce", "hubspot", or "marketo")
 
 Directory Structure:
     sync-output/: Input data from source systems
@@ -187,10 +187,23 @@ def _get_handler(connector_id: str, flow_id: str, reader: gs.Reader,
             output_dir=OUTPUT_DIR,
             target_config=target_config,
         )
+    elif connector_id_lower == "marketo":
+        from marketo_handler import MarketoHandler
+        return MarketoHandler(
+            connector_id=connector_id,
+            flow_id=flow_id,
+            reader=reader,
+            mapping_for_flow=mapping_for_flow,
+            stream_name_mapping=stream_name_mapping,
+            input_dir=INPUT_DIR,
+            snapshot_dir=SNAPSHOT_DIR,
+            output_dir=OUTPUT_DIR,
+            target_config=target_config,
+        )
     else:
         raise ValueError(
             f"Unsupported connector: {connector_id}. "
-            f"Supported connectors are: salesforce, hubspot"
+            f"Supported connectors are: salesforce, hubspot, marketo"
         )
 
 
