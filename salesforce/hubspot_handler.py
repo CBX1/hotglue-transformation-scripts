@@ -159,12 +159,7 @@ class HubSpotHandler(BaseETLHandler):
         # Also drop directly from DataFrame to catch any columns not tracked in stream_columns
         contacts_df = contacts_df_raw.drop(columns=list(self.READ_ONLY_FIELDS), errors="ignore")
 
-        # Rename 'id' to 'externalId' for deduplication tracking
-        if "id" in contacts_df.columns:
-            contacts_df = contacts_df.rename(columns={"id": "externalId"})
-        else:
-            logger.warning("No 'id' column found in contacts data")
-            contacts_df["externalId"] = None
+    
 
         df_out = contacts_df.copy()
 
