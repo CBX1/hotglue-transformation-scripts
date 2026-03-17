@@ -51,6 +51,10 @@ class HubSpotHandler(BaseETLHandler):
         "hs_latest_source_timestamp",
         "hs_email_last_click_date",
         "crmListMembershipDetails",
+        "updatedAt",
+        "pendingCriticalFieldsForCrmSync",
+        "globalUnsubscribe"
+        
     }
 
     def __init__(self, *args, target_config: Optional[Dict] = None, **kwargs):
@@ -172,8 +176,6 @@ class HubSpotHandler(BaseETLHandler):
         df_out = drop_sent_records("contacts", df_out, sent_contacts, None)
         
         
-        # Remove externalId after deduplication and snapshot (not needed in final output)
-        df_out = df_out.drop(columns=["externalId"], errors="ignore")
         
         # Write to output
         self.write_to_singer(df_out, self.stream_name_mapping[mapping_name])
