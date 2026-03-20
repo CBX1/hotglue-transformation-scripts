@@ -51,6 +51,10 @@ class HubSpotHandler(BaseETLHandler):
         "hs_latest_source_timestamp",
         "hs_email_last_click_date",
         "crmListMembershipDetails",
+        "updatedAt",
+        "pendingCriticalFieldsForCrmSync",
+        "globalUnsubscribe"
+        
     }
 
     def __init__(self, *args, target_config: Optional[Dict] = None, **kwargs):
@@ -151,29 +155,17 @@ class HubSpotHandler(BaseETLHandler):
         
         # Apply mapping for contacts
         mapping_name = "contacts"
-        stream_columns, contacts_df = map_stream_data(contacts_df_raw, mapping_name, mapping)
+        stream_columns=contacts_df_raw.columns
 
         # Remove HubSpot read-only fields so we never attempt to update them
         # Filter from stream_columns list
         stream_columns = [col for col in stream_columns if col not in self.READ_ONLY_FIELDS]
         # Also drop directly from DataFrame to catch any columns not tracked in stream_columns
-        contacts_df = contacts_df.drop(columns=list(self.READ_ONLY_FIELDS), errors="ignore")
+        contacts_df = contacts_df_raw.drop(columns=list(self.READ_ONLY_FIELDS), errors="ignore")
 
-        new_data = contacts_df.copy()
+    
 
-        # Prepare final output (without association formatting)
-        # Note: For WRITE operations, we don't create a merged snapshot to avoid
-        # mixing READ (HubSpot->CBX1) and WRITE (CBX1->HubSpot) data.
-        # The CSV snapshot tracks previously sent records correctly.
-        ordered_columns = []
-        for col in stream_columns:
-            if col not in ordered_columns:
-                ordered_columns.append(col)
-
-        account_fields = {"AccountId", "accountId", "InputAccountId", "RemoteAccountId"}
-        ignored_fields = account_fields.union(self.READ_ONLY_FIELDS)
-        output_columns = [col for col in ordered_columns if col not in ignored_fields]
-        df_out = contacts_df[output_columns].copy()
+        df_out = contacts_df.copy()
 
         # Filter out already sent records
         # Read the CSV snapshot directly (with flow_id suffix) to avoid loading
@@ -181,7 +173,9 @@ class HubSpotHandler(BaseETLHandler):
         import gluestick as gs
         snapshot_name = f"{self.stream_name_mapping[mapping_name]}_{self.flow_id}"
         sent_contacts = gs.read_snapshots(snapshot_name, self.snapshot_dir)
-        df_out = drop_sent_records("contacts", df_out, sent_contacts, new_data)
+        df_out = drop_sent_records("contacts", df_out, sent_contacts, None)
+        
+        
         
         # Write to output
         self.write_to_singer(df_out, self.stream_name_mapping[mapping_name])
