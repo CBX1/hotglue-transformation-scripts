@@ -15,7 +15,7 @@ Key differences from HubSpot:
 """
 
 import logging
-from typing import Dict, Optional, Set
+from typing import Optional, Set
 
 import pandas as pd
 import numpy as np
@@ -23,7 +23,6 @@ import gluestick as gs
 
 from base_handler import BaseETLHandler
 from utils import (
-    map_stream_data,
     drop_sent_records,
 )
 
@@ -54,7 +53,7 @@ class MarketoHandler(BaseETLHandler):
         "anonymousIP",
     }
 
-    def __init__(self, *args, target_config: Optional[Dict] = None, **kwargs):
+    def __init__(self, *args, target_config: Optional[dict] = None, **kwargs):
         super().__init__(*args, **kwargs)
         self.target_config = target_config or {}
         self.connector_id = "marketo"
@@ -64,63 +63,54 @@ class MarketoHandler(BaseETLHandler):
         Handle the write operation for Marketo.
 
         Processes contacts stream and writes as leads to Marketo.
+        The backend egestion service (TenantEgestionMapping) already returns data
+        in Marketo field format, so this handler is a thin passthrough that strips
+        read-only fields and deduplicates against snapshots.
+
         Companies are not supported in write (no companies stream in tap-marketo).
         """
-        if not self.mapping_for_flow:
-            raise ValueError("No write mapping found for Marketo flow")
-
-        mapping = self.build_write_mapping()
         streams = self.list_available_streams()
 
         logger.info(f"Marketo write: evaluating {len(streams)} streams; only 'contacts' will be written as leads")
 
         for stream in streams:
             if stream == "contacts":
-                self._handle_contacts_write(mapping)
+                self._handle_contacts_write()
             else:
                 logger.info(f"Marketo write: skipping stream '{stream}' by policy")
 
-    def _handle_contacts_write(self, mapping: Dict) -> None:
+    # Marketo's primary person entity stream name
+    MARKETO_LEADS_STREAM = "leads"
+
+    def _handle_contacts_write(self) -> None:
         """
         Handle contacts write for Marketo.
 
-        Processes contacts data, strips Marketo read-only fields,
-        deduplicates against snapshots, and outputs in Singer format.
-        The output stream name is determined by stream_name_mapping
-        (typically maps contacts -> leads for Marketo).
+        The tap (cbx1-tap-hotglue) extracts contacts from the backend egestion
+        service which already applies the TenantEgestionMapping to produce data
+        in Marketo lead field format. This handler passes through the data,
+        strips Marketo read-only fields, deduplicates against snapshots, and
+        outputs in Singer format as the 'leads' stream.
         """
         logger.info("Processing contacts for Marketo")
 
         contacts_df_raw = self.get_stream_data("contacts")
 
-        mapping_name = "contacts"
-        stream_columns, contacts_df = map_stream_data(contacts_df_raw, mapping_name, mapping)
-
         # Remove Marketo read-only fields
-        stream_columns = [col for col in stream_columns if col not in self.READ_ONLY_FIELDS]
-        contacts_df = contacts_df.drop(columns=list(self.READ_ONLY_FIELDS), errors="ignore")
+        contacts_df = contacts_df_raw.drop(columns=list(self.READ_ONLY_FIELDS), errors="ignore")
 
-        new_data = contacts_df.copy()
+        df_out = contacts_df.copy()
 
-        # Deduplicate columns
-        ordered_columns = []
-        for col in stream_columns:
-            if col not in ordered_columns:
-                ordered_columns.append(col)
-
-        # Remove account-related fields (not applicable for Marketo leads)
-        account_fields = {"AccountId", "accountId", "InputAccountId", "RemoteAccountId"}
-        ignored_fields = account_fields.union(self.READ_ONLY_FIELDS)
-        output_columns = [col for col in ordered_columns if col not in ignored_fields]
-        df_out = contacts_df[output_columns].copy()
+        # Marketo always uses "leads" as the output stream name
+        output_stream = self.stream_name_mapping.get("contacts", self.MARKETO_LEADS_STREAM)
 
         # Filter out already sent records
-        snapshot_name = f"{self.stream_name_mapping[mapping_name]}_{self.flow_id}"
+        snapshot_name = f"{output_stream}_{self.flow_id}"
         sent_contacts = gs.read_snapshots(snapshot_name, self.snapshot_dir)
-        df_out = drop_sent_records("contacts", df_out, sent_contacts, new_data)
+        df_out = drop_sent_records("contacts", df_out, sent_contacts, None)
 
-        # Write to output (stream_name_mapping maps contacts -> leads for Marketo)
-        self.write_to_singer(df_out, self.stream_name_mapping[mapping_name])
+        # Write to output as "leads" stream for target-marketo
+        self.write_to_singer(df_out, output_stream)
         logger.info(f"Processed {len(df_out)} contact records for Marketo (as leads)")
 
     def handle_read(self) -> None:
