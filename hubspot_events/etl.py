@@ -26,9 +26,9 @@ EVENT_STREAM_CONFIG = {
         "event_name_field": "event_action",  # open -> diff_email_open, click -> diff_email_click
         "event_name_prefix": "diff_email_",
         "properties": [
-            "diff_email_id", "diff_email_subject", "diff_campaign_id",
-            "diff_campaign_name", "diff_is_bot", "diff_bot_filtered",
-            "diff_in_business_hours",
+            "diff_email_id", "diff_email_subject", "diff_link_url",
+            "diff_campaign_id", "diff_campaign_name", "diff_event_action",
+            "diff_is_bot", "diff_bot_filtered", "diff_in_business_hours",
         ],
     },
     "form_events": {
