@@ -1,13 +1,30 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-"""HubSpot Custom Event Sync ETL - transforms CBX1 events to HubSpot custom events."""
+"""HubSpot Custom Event Sync ETL.
+
+Reads batch event records from cbx1-tap event streams and outputs them
+for the HubSpot Custom Events batch API (POST /events/v3/send/batch).
+
+Input format (from cbx1-tap, one Singer RECORD per page/batch):
+    {
+        "inputs": [
+            {"eventName": "diff_send", "email": "...", "objectId": "...", "occurredAt": "...", "uuid": "...", "properties": {...}},
+            ...
+        ],
+        "uuid": "<last_event_uuid>",
+        "occurredAt": "<last_event_timestamp>"
+    }
+
+Output format (for HubSpot target connector, stream: /events/v3/send/batch):
+    Same structure — each record is a batch payload ready for HubSpot's bulk API.
+"""
 
 import ast
 import json
 import logging
 import os
-from typing import Dict, List, Optional, Tuple
+from typing import Optional
 
 import gluestick as gs
 import pandas as pd
@@ -20,34 +37,10 @@ INPUT_DIR = f"{ROOT_DIR}/sync-output"
 SNAPSHOT_DIR = f"{ROOT_DIR}/snapshots"
 OUTPUT_DIR = f"{ROOT_DIR}/etl-output"
 
-# Event stream name -> HubSpot custom event name prefix
-EVENT_STREAM_CONFIG = {
-    "email_events": {
-        "event_name_field": "event_action",  # open -> diff_email_open, click -> diff_email_click
-        "event_name_prefix": "diff_email_",
-        "properties": [
-            "diff_email_id", "diff_email_subject", "diff_link_url",
-            "diff_campaign_id", "diff_campaign_name", "diff_event_action",
-            "diff_is_bot", "diff_bot_filtered", "diff_in_business_hours",
-        ],
-    },
-    "form_events": {
-        "event_name_static": "diff_form_fill",
-        "properties": [
-            "diff_form_id", "diff_form_name", "diff_page_url",
-            "diff_is_leadgen_form", "diff_campaign_name",
-            "diff_utm_source", "diff_utm_medium", "diff_utm_campaign",
-        ],
-    },
-    "page_visits": {
-        "event_name_static": "diff_page_visit",
-        "properties": [
-            "diff_page_url", "diff_page_title", "diff_referrer",
-            "diff_session_id", "diff_action", "diff_device",
-            "diff_browser", "diff_bot_filtered",
-        ],
-    },
-}
+# Event streams that this ETL processes
+SUPPORTED_STREAMS = {"email_events", "page_events"}
+
+OUTPUT_STREAM = "/events/v3/send/batch"
 
 
 def _load_json(path: str) -> Optional[dict]:
@@ -57,95 +50,106 @@ def _load_json(path: str) -> Optional[dict]:
         return json.load(f)
 
 
-def _load_tenant_config() -> dict:
-    """Load tenant config from snapshots."""
-    cfg = _load_json(f"{SNAPSHOT_DIR}/tenant-config.json")
-    return cfg or {}
-
-
-def _build_hubspot_event_name(stream_config: dict, record: dict) -> str:
-    """Build the HubSpot custom event name for a record."""
-    if "event_name_static" in stream_config:
-        return stream_config["event_name_static"]
-    # Dynamic: based on event_action field (e.g., "open" -> "diff_email_open")
-    action = record.get(stream_config.get("event_name_field", "event_action"), "unknown")
-    return f"{stream_config['event_name_prefix']}{action}"
-
-
-def _transform_to_hubspot_event(record: dict, stream_config: dict) -> dict:
-    """Transform a single egestion record to HubSpot custom event format."""
-    event_name = _build_hubspot_event_name(stream_config, record)
-
-    # Extract properties (only include fields that exist in the record)
-    properties = {}
-    for prop in stream_config["properties"]:
-        if prop in record and record[prop] is not None:
-            properties[prop] = str(record[prop])
-
-    return {
-        "eventName": event_name,
-        "objectType": "contacts",
-        "email": record.get("email", record.get("contact_email", "")),
-        "occurredAt": record.get("occurredAt", record.get("occurred_at", "")),
-        "properties": properties,
-    }
-
-
-def _drop_sent_records(stream: str, stream_data: pd.DataFrame, flow_id: str) -> pd.DataFrame:
-    """Filter out records that have already been sent."""
-    sent_data = gs.read_snapshots(f"{stream}_{flow_id}", SNAPSHOT_DIR)
+def _read_sent_uuids(stream_name: str, flow_id: str) -> set:
+    """Read previously sent event UUIDs from snapshot."""
+    sent_data = gs.read_snapshots(f"{stream_name}_{flow_id}", SNAPSHOT_DIR)
     if sent_data is None or sent_data.empty:
-        return stream_data
-    if "externalId" not in stream_data.columns or "InputId" not in sent_data.columns:
-        return stream_data
-    return stream_data[~stream_data["externalId"].isin(sent_data["InputId"])]
+        return set()
+    if "InputId" in sent_data.columns:
+        return set(sent_data["InputId"].tolist())
+    return set()
+
+
+def _save_sent_uuids(stream_name: str, flow_id: str, uuids: list) -> None:
+    """Save sent event UUIDs to snapshot for deduplication."""
+    if not uuids:
+        return
+    df = pd.DataFrame({"InputId": uuids})
+    # Append to existing snapshot
+    existing = gs.read_snapshots(f"{stream_name}_{flow_id}", SNAPSHOT_DIR)
+    if existing is not None and not existing.empty:
+        df = pd.concat([existing, df], ignore_index=True).drop_duplicates(subset=["InputId"])
+    snapshot_path = f"{SNAPSHOT_DIR}/{stream_name}_{flow_id}.snapshot.csv"
+    df.to_csv(snapshot_path, index=False)
+    logger.info(f"Saved {len(uuids)} UUIDs to snapshot for {stream_name}")
 
 
 def _handle_write_job(reader: gs.Reader, flow_id: str) -> None:
-    """Process event streams and output HubSpot custom event Singer records."""
+    """Process batch event records and output for HubSpot bulk API."""
     streams = ast.literal_eval(str(reader))
 
     for stream_name in streams:
-        if stream_name not in EVENT_STREAM_CONFIG:
-            logger.info(f"Skipping unknown stream: {stream_name}")
+        if stream_name not in SUPPORTED_STREAMS:
+            logger.info(f"Skipping unsupported stream: {stream_name}")
             continue
 
-        stream_config = EVENT_STREAM_CONFIG[stream_name]
         logger.info(f"Processing event stream: {stream_name}")
 
-        # Read stream data
         stream_data = reader.get(stream_name)
         if stream_data is None or stream_data.empty:
             logger.info(f"No data for stream: {stream_name}")
             continue
 
-        # Deduplicate against previously sent records
-        stream_data = _drop_sent_records(stream_name, stream_data, flow_id)
-        if stream_data.empty:
-            logger.info(f"No new records for stream: {stream_name}")
+        # Load previously sent UUIDs for deduplication
+        sent_uuids = _read_sent_uuids(stream_name, flow_id)
+        logger.info(f"Loaded {len(sent_uuids)} previously sent UUIDs for {stream_name}")
+
+        output_batches = []
+        new_uuids = []
+        total_events = 0
+        skipped_events = 0
+
+        for _, row in stream_data.iterrows():
+            inputs = row.get("inputs")
+            if inputs is None:
+                continue
+
+            # inputs is a list of event dicts (already in HubSpot format)
+            if isinstance(inputs, str):
+                try:
+                    inputs = json.loads(inputs)
+                except json.JSONDecodeError:
+                    logger.warning(f"Failed to parse inputs as JSON, skipping batch")
+                    continue
+
+            if not isinstance(inputs, list):
+                logger.warning(f"Expected inputs to be a list, got {type(inputs)}, skipping")
+                continue
+
+            # Filter out already-sent events
+            new_events = []
+            for event in inputs:
+                event_uuid = event.get("uuid", "")
+                if event_uuid and event_uuid in sent_uuids:
+                    skipped_events += 1
+                    continue
+                new_events.append(event)
+                if event_uuid:
+                    new_uuids.append(event_uuid)
+
+            if not new_events:
+                continue
+
+            total_events += len(new_events)
+
+            # Output batch record — ready for HubSpot POST /events/v3/send/batch
+            output_batches.append({"inputs": new_events})
+
+        if not output_batches:
+            logger.info(f"No new events for {stream_name} (skipped {skipped_events} already-sent)")
             continue
 
-        logger.info(f"Processing {len(stream_data)} new records for {stream_name}")
+        logger.info(
+            f"Outputting {len(output_batches)} batches with {total_events} events "
+            f"for {stream_name} (skipped {skipped_events} already-sent)"
+        )
 
-        # Transform to HubSpot custom event format
-        events = []
-        for _, record in stream_data.iterrows():
-            event = _transform_to_hubspot_event(record.to_dict(), stream_config)
-            events.append(event)
+        # Write as Singer output
+        output_df = pd.DataFrame(output_batches)
+        gs.to_singer(output_df, OUTPUT_STREAM, OUTPUT_DIR, allow_objects=True)
 
-        # Convert to DataFrame for Singer output
-        events_df = pd.DataFrame(events)
-
-        # Create snapshot for deduplication
-        if "externalId" in stream_data.columns:
-            gs.snapshot_records(stream_data, stream_name, SNAPSHOT_DIR, pk="externalId")
-
-        # Output as Singer RECORD messages
-        # Output stream name includes "custom_events_" prefix for HubSpot target connector
-        output_stream = f"custom_events_{stream_name}"
-        gs.to_singer(events_df, output_stream, OUTPUT_DIR, allow_objects=True)
-
-        logger.info(f"Wrote {len(events)} events for {output_stream}")
+        # Save new UUIDs to snapshot
+        _save_sent_uuids(stream_name, flow_id, new_uuids)
 
 
 def main() -> None:
