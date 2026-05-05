@@ -15,6 +15,7 @@ These utilities are designed to work with the HotGlue framework and support
 both Salesforce and HubSpot connector operations.
 """
 
+import glob
 import json as _json
 import logging
 import os
@@ -503,43 +504,119 @@ READ_CHUNK_SIZE = 10_000
 
 
 def iter_stream_chunks(
-    reader: gs.Reader,
+    input_dir: str,
     stream: str,
     chunk_size: int = READ_CHUNK_SIZE,
 ) -> Iterator[pd.DataFrame]:
     """
-    Load a stream via gluestick Reader and yield DataFrame slices of chunk_size rows.
+    Yield DataFrames of at most chunk_size rows from stream input files.
 
-    Using the Reader (rather than reading files directly) makes this
-    format-agnostic: gluestick handles .parquet, .json, .singer, .csv and any
-    other format a HotGlue tap target might write — we never inspect file
-    extensions or parse wire formats ourselves.
-
-    Memory profile: gluestick loads the full stream into one DataFrame on
-    get(). This function then yields slices so downstream pipeline steps
-    (enrichment, wrapping, Singer serialisation) only process chunk_size rows
-    at a time. The full DataFrame is released once all slices have been yielded.
-    Peak memory = 1 × full stream + 1 × chunk (vs 3–5 × full stream without
-    chunking due to pipeline copies and to_dict() materialisation).
+    HotGlue sync-output commonly stores records as stream-prefixed parquet
+    files, such as contacts-20260505T083605.parquet. Some local or target
+    variants may write line-delimited Singer/JSON files. Both paths are read
+    in chunks so the full stream is not loaded into a single DataFrame.
     """
+    parquet_files = _find_stream_files(input_dir, stream, (".parquet",))
+    if parquet_files:
+        for parquet_file in parquet_files:
+            yield from _iter_parquet_stream_chunks(parquet_file, chunk_size)
+        return
+
+    record_files = _find_stream_files(input_dir, stream, (".singer", ".json", ".jsonl", ""))
+    if record_files:
+        for record_file in record_files:
+            yield from _iter_record_stream_chunks(record_file, stream, chunk_size)
+        return
+
     try:
-        df = reader.get(stream, catalog_types=True)
-    except Exception as exc:
-        logger.warning("Could not load stream '%s' via Reader: %s", stream, exc)
+        available = sorted(os.listdir(input_dir))
+    except OSError:
+        available = ["<unreadable>"]
+
+    logger.warning(
+        "No data file found for stream '%s' in %s. Available files: %s",
+        stream,
+        input_dir,
+        available,
+    )
+
+
+def _find_stream_files(input_dir: str, stream: str, extensions: Tuple[str, ...]) -> List[str]:
+    """Return stream files in deterministic order for exact and timestamped names."""
+    files: List[str] = []
+    for ext in extensions:
+        exact = os.path.join(input_dir, f"{stream}{ext}")
+        if os.path.exists(exact):
+            files.append(exact)
+
+        if ext:
+            files.extend(glob.glob(os.path.join(input_dir, f"{stream}-*{ext}")))
+
+    return sorted(set(files))
+
+
+def _iter_parquet_stream_chunks(
+    parquet_file: str,
+    chunk_size: int,
+) -> Iterator[pd.DataFrame]:
+    """Yield row batches from a parquet file without loading the full file."""
+    try:
+        import pyarrow.parquet as pq
+    except ImportError:
+        logger.warning(
+            "pyarrow is not installed; reading parquet file %s in one pandas batch",
+            parquet_file,
+        )
+        df = pd.read_parquet(parquet_file)
+        if not df.empty:
+            yield df
         return
 
-    if df is None or df.empty:
-        logger.info("Stream '%s' is empty; no chunks to process", stream)
-        return
+    parquet = pq.ParquetFile(parquet_file)
+    for batch in parquet.iter_batches(batch_size=chunk_size):
+        df = batch.to_pandas()
+        if not df.empty:
+            yield df
 
-    total_rows = len(df)
-    logger.info("Loaded %d rows for stream '%s'; processing in chunks of %d", total_rows, stream, chunk_size)
 
-    for start in range(0, total_rows, chunk_size):
-        yield df.iloc[start: start + chunk_size].copy()
+def _iter_record_stream_chunks(
+    record_file: str,
+    stream: str,
+    chunk_size: int,
+) -> Iterator[pd.DataFrame]:
+    """Yield batches from line-delimited Singer or plain JSON records."""
+    batch: list = []
+    with open(record_file, "r", encoding="utf-8") as fh:
+        for raw in fh:
+            raw = raw.strip()
+            if not raw:
+                continue
 
-    # Release the full DataFrame after all slices are exhausted
-    del df
+            try:
+                msg = _json.loads(raw)
+            except _json.JSONDecodeError:
+                logger.debug("Skipping malformed line in %s", record_file)
+                continue
+
+            if not isinstance(msg, dict):
+                continue
+
+            msg_type = msg.get("type")
+            if msg_type == "RECORD":
+                if msg.get("stream") not in (None, stream):
+                    continue
+                batch.append(msg.get("record", msg))
+            elif msg_type in ("SCHEMA", "STATE"):
+                continue
+            else:
+                batch.append(msg)
+
+            if len(batch) >= chunk_size:
+                yield pd.DataFrame(batch)
+                batch = []
+
+    if batch:
+        yield pd.DataFrame(batch)
 
 
 def append_singer_records(
