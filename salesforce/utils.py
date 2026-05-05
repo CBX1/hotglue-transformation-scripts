@@ -15,8 +15,10 @@ These utilities are designed to work with the HotGlue framework and support
 both Salesforce and HubSpot connector operations.
 """
 
+import json as _json
 import logging
-from typing import Dict, List, Optional, Tuple
+import os
+from typing import Dict, Iterator, List, Optional, Tuple
 
 import pandas as pd
 import gluestick as gs
@@ -491,3 +493,95 @@ def get_contact_data(
         result = contacts if contacts is not None else pd.DataFrame()
         logger.debug(f"Returning {len(result)} contact records for {connector_id}")
         return result
+
+
+# ---------------------------------------------------------------------------
+# Chunked Singer I/O helpers
+# ---------------------------------------------------------------------------
+
+READ_CHUNK_SIZE = 10_000
+
+
+def iter_stream_chunks(
+    input_dir: str,
+    stream: str,
+    chunk_size: int = READ_CHUNK_SIZE,
+) -> Iterator[pd.DataFrame]:
+    """
+    Yield DataFrames of at most chunk_size rows from a Singer stream file.
+
+    Reads the .singer file line-by-line so the full stream is never held in
+    memory at once — peak memory is bounded to chunk_size rows × column count
+    regardless of total dataset size.
+
+    Yields nothing and logs a warning when the stream file is absent.
+    """
+    singer_file = os.path.join(input_dir, f"{stream}.singer")
+    if not os.path.exists(singer_file):
+        logger.warning(
+            "Singer file not found for stream '%s' in %s; no chunks to iterate",
+            stream, input_dir,
+        )
+        return
+
+    batch: list = []
+    with open(singer_file, "r", encoding="utf-8") as fh:
+        for raw in fh:
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                msg = _json.loads(raw)
+            except _json.JSONDecodeError:
+                logger.debug("Skipping malformed Singer line in %s", singer_file)
+                continue
+            if msg.get("type") == "RECORD" and msg.get("stream") == stream:
+                batch.append(msg["record"])
+                if len(batch) >= chunk_size:
+                    yield pd.DataFrame(batch)
+                    batch.clear()
+
+    if batch:
+        yield pd.DataFrame(batch)
+
+
+def append_singer_records(
+    df: pd.DataFrame,
+    stream_name: str,
+    output_dir: str,
+    first_chunk: bool,
+) -> None:
+    """
+    Append Singer RECORD messages to the output file for stream_name.
+
+    On first_chunk=True the file is created (or truncated) and a SCHEMA message
+    is prepended; subsequent calls open in append mode and emit RECORDs only —
+    so the schema appears exactly once even across many chunks.
+
+    Object / dict values are serialised to JSON strings to match gluestick's
+    allow_objects=True behaviour. Null values are omitted from each record.
+    """
+    output_path = os.path.join(output_dir, f"{stream_name}.singer")
+    mode = "w" if first_chunk else "a"
+
+    with open(output_path, mode, encoding="utf-8") as fh:
+        if first_chunk:
+            properties = {col: {"type": ["null", "string"]} for col in df.columns}
+            schema_msg = {
+                "type": "SCHEMA",
+                "stream": stream_name,
+                "schema": {"type": "object", "properties": properties},
+                "key_properties": [],
+            }
+            fh.write(_json.dumps(schema_msg) + "\n")
+
+        for record in df.to_dict(orient="records"):
+            clean: dict = {}
+            for k, v in record.items():
+                if v is None or (isinstance(v, float) and pd.isna(v)):
+                    continue
+                # Serialise nested objects to JSON strings (gluestick allow_objects=True parity)
+                clean[k] = _json.dumps(v, default=str) if isinstance(v, (dict, list)) else v
+            fh.write(
+                _json.dumps({"type": "RECORD", "stream": stream_name, "record": clean}) + "\n"
+            )

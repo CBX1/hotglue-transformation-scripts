@@ -9,6 +9,7 @@ Note: HubSpot associations are handled by HubSpot's own system based on configur
 so this handler does not include association logic.
 """
 
+import gc
 import logging
 from typing import Dict, List, Optional, Set
 
@@ -22,6 +23,9 @@ from utils import (
     drop_sent_records,
     get_contact_data,
     transform_dot_notation_to_nested,
+    iter_stream_chunks,
+    append_singer_records,
+    prepare_for_singer,
 )
 
 logger = logging.getLogger(__name__)
@@ -434,57 +438,56 @@ class HubSpotHandler(BaseETLHandler):
         """
         Handle the read operation for HubSpot data.
 
-        This method:
-        1. Passes through raw HubSpot fields as-is (no heavy normalization)
-        2. Enriches with context needed by Different:
-           - Owner details (from owners stream)
-           - List membership details (from _hg_list_memberships + lists stream)
-           - df_accountId (from snapshots for contacts)
+        Processes contacts and companies in fixed-size chunks (READ_CHUNK_SIZE rows)
+        read directly from the Singer input file. Each chunk is enriched and written
+        to the Singer output file in append mode, so peak memory is bounded to one
+        chunk regardless of total dataset size.
+
+        Shared lookup tables (owners, lists) are built once and reused across chunks.
+        An explicit gc.collect() is called between streams to release memory before
+        the next stream begins.
         """
-        logger.info("Starting HubSpot read operation (passthrough + context enrichment)")
+        logger.info("Starting HubSpot read operation (chunked passthrough + context enrichment)")
 
         data_streams = self.list_available_streams()
         if not data_streams or not self.mapping_for_flow:
             logger.warning("No streams or mapping available for read operation")
             return
 
-        mapping = self.build_read_mapping()
-        # Prepare owner lookup for enrichment
+        # Build small lookup tables once — these stay in memory throughout (< 1 MB each)
         owner_lookup = self._prepare_owner_lookup(data_streams)
-
-        # Prepare list lookup for CRM list membership enrichment
         list_lookup = self._prepare_list_lookup(data_streams)
 
-        # Only process relevant streams for data warehouse
+        inverse_mapping = {v: k for k, v in self.stream_name_mapping.items()}
         target_streams = [s for s in data_streams if s in {"contacts", "companies"}]
 
         for stream in target_streams:
-            logger.info(f"Processing read stream (passthrough + enrichment): {stream}")
-            stream_data = self.get_stream_data(stream)
-            stream_data = self._filter_archived_records(stream_data, stream)
-            owner_column = None
-
-          
-            stream_data, owner_column = self._apply_read_mapping(
-                    stream_data, stream
-                )   
-
-            # Enrich with owner information for contacts and companies
-            if stream in {"contacts", "companies"}:
-                stream_data = self._merge_owner_details(stream_data, owner_lookup, owner_column)
-            
-
-            # Enrich with list membership context
-            stream_data = self._populate_list_memberships(stream_data, stream, list_lookup)
-            # Wrap records in {data, lookupKey, sourceRecordId} structure
-            stream_data = self._wrap_records_with_metadata(stream_data, stream)
-
-            # Determine output stream name
-            inverse_mapping = {v: k for k, v in self.stream_name_mapping.items()}
+            logger.info("Processing read stream (chunked): %s", stream)
             output_stream = inverse_mapping.get(stream, stream)
+            first_chunk = True
+            total_written = 0
 
-            self.write_to_singer(stream_data, output_stream)
-            logger.info(f"Wrote {len(stream_data)} records for read stream: {stream}")
+            for chunk_df in iter_stream_chunks(self.input_dir, stream):
+                chunk_df = self._filter_archived_records(chunk_df, stream)
+                if chunk_df is None or chunk_df.empty:
+                    continue
+
+                chunk_df, owner_column = self._apply_read_mapping(chunk_df, stream)
+                chunk_df = self._merge_owner_details(chunk_df, owner_lookup, owner_column)
+                chunk_df = self._populate_list_memberships(chunk_df, stream, list_lookup)
+                chunk_df = self._wrap_records_with_metadata(chunk_df, stream)
+
+                if chunk_df is None or chunk_df.empty:
+                    continue
+
+                prepared = prepare_for_singer(chunk_df)
+                append_singer_records(prepared, output_stream, self.output_dir, first_chunk)
+                total_written += len(prepared)
+                first_chunk = False
+                del chunk_df, prepared
+
+            logger.info("Wrote %d records for read stream: %s", total_written, stream)
+            gc.collect()
 
     def _prepare_owner_lookup(self, streams: List[str]) -> Optional[pd.DataFrame]:
         """
@@ -601,8 +604,6 @@ class HubSpotHandler(BaseETLHandler):
         if df is None or df.empty:
             return df
 
-        df = df.copy()
-
         if "_hg_list_memberships" not in df.columns:
             logger.debug("No _hg_list_memberships field found")
             df["crmListMembershipDetails"] = None
@@ -656,7 +657,6 @@ class HubSpotHandler(BaseETLHandler):
         if df is None or df.empty or "archived" not in df.columns:
             return df
 
-        df = df.copy()
         archived_mask = df["archived"].fillna(False)
         filtered_df = df.loc[~archived_mask].copy()
         removed = len(df) - len(filtered_df)
@@ -684,7 +684,6 @@ class HubSpotHandler(BaseETLHandler):
         Returns:
             Tuple of (transformed DataFrame, owner column name if present)
         """
-        df = df.copy()
         owner_column = None
         
         # Check for owner column
@@ -838,8 +837,6 @@ class HubSpotHandler(BaseETLHandler):
         Returns:
             DataFrame with owner details merged
         """
-        df = df.copy()
-        
         # Add default columns if no owner lookup is available
         if owner_lookup is None or not owner_column or owner_column not in df.columns:
             if "crmOwnerName" not in df.columns:
