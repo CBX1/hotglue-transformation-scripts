@@ -75,9 +75,8 @@ Additional expectations:
 
 ## Write Policy
 
-- For both connectors, write jobs only push `contacts`.
 - Salesforce: Only `Contact`/`Lead` are written (split determined by account linkage). `Account` (and other objects) are not written.
-- HubSpot: Only `contacts` are written. `companies` (and other objects) are not written.
+- HubSpot: `contacts` are always written. `accounts` (HubSpot companies object) are written **only when the tenant has a `TenantEgestionMapping` configured for `ACCOUNT → HUBSPOT`** — the presence of an `"accounts"` key in `stream_name_mapping` is the opt-in signal. Other objects are not written.
 
 ## Commit & Pull Request Guidelines
 Write brief, imperative commit titles (e.g., "Refactor into connector handlers"). PR descriptions should:
