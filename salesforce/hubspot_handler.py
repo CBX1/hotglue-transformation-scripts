@@ -467,7 +467,7 @@ class HubSpotHandler(BaseETLHandler):
             first_chunk = True
             total_written = 0
 
-            for chunk_df in iter_stream_chunks(self.input_dir, stream):
+            for chunk_df in iter_stream_chunks(self.reader, stream):
                 chunk_df = self._filter_archived_records(chunk_df, stream)
                 if chunk_df is None or chunk_df.empty:
                     continue

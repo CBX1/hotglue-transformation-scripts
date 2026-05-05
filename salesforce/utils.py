@@ -502,84 +502,44 @@ def get_contact_data(
 READ_CHUNK_SIZE = 10_000
 
 
-def _find_stream_file(input_dir: str, stream: str) -> Optional[str]:
-    """
-    Locate a stream data file by trying common extensions used by HotGlue tap targets.
-
-    Returns the first matching path, or None. Logs available directory contents
-    when no match is found to aid diagnosis of new naming conventions.
-    """
-    for ext in (".singer", ".json", ".jsonl", ""):
-        candidate = os.path.join(input_dir, f"{stream}{ext}")
-        if os.path.exists(candidate):
-            return candidate
-
-    try:
-        available = sorted(os.listdir(input_dir))
-    except OSError:
-        available = ["<unreadable>"]
-    logger.warning(
-        "No data file found for stream '%s' in %s. "
-        "Available files: %s",
-        stream, input_dir, available,
-    )
-    return None
-
-
 def iter_stream_chunks(
-    input_dir: str,
+    reader: gs.Reader,
     stream: str,
     chunk_size: int = READ_CHUNK_SIZE,
 ) -> Iterator[pd.DataFrame]:
     """
-    Yield DataFrames of at most chunk_size rows from a Singer stream file.
+    Load a stream via gluestick Reader and yield DataFrame slices of chunk_size rows.
 
-    Reads the file line-by-line so the full stream is never held in memory at
-    once — peak memory is bounded to chunk_size rows × column count regardless
-    of total dataset size.
+    Using the Reader (rather than reading files directly) makes this
+    format-agnostic: gluestick handles .parquet, .json, .singer, .csv and any
+    other format a HotGlue tap target might write — we never inspect file
+    extensions or parse wire formats ourselves.
 
-    Supports two line formats found in HotGlue sync-output directories:
-    - Singer-wrapped: {"type":"RECORD","stream":"...","record":{...}}
-    - Plain NDJSON:   {"id":"1","name":"...",...}
-
-    Tries common file extensions (.singer, .json, .jsonl, no extension) and
-    logs directory contents when no file is found.
+    Memory profile: gluestick loads the full stream into one DataFrame on
+    get(). This function then yields slices so downstream pipeline steps
+    (enrichment, wrapping, Singer serialisation) only process chunk_size rows
+    at a time. The full DataFrame is released once all slices have been yielded.
+    Peak memory = 1 × full stream + 1 × chunk (vs 3–5 × full stream without
+    chunking due to pipeline copies and to_dict() materialisation).
     """
-    stream_file = _find_stream_file(input_dir, stream)
-    if stream_file is None:
+    try:
+        df = reader.get(stream, catalog_types=True)
+    except Exception as exc:
+        logger.warning("Could not load stream '%s' via Reader: %s", stream, exc)
         return
 
-    batch: list = []
-    with open(stream_file, "r", encoding="utf-8") as fh:
-        for raw in fh:
-            raw = raw.strip()
-            if not raw:
-                continue
-            try:
-                msg = _json.loads(raw)
-            except _json.JSONDecodeError:
-                logger.debug("Skipping malformed line in %s", stream_file)
-                continue
-            if not isinstance(msg, dict):
-                continue
+    if df is None or df.empty:
+        logger.info("Stream '%s' is empty; no chunks to process", stream)
+        return
 
-            msg_type = msg.get("type")
-            if msg_type == "RECORD":
-                # Singer format — HotGlue dedicates one file per stream so no
-                # stream-name filter is needed, but accept it as extra safety.
-                batch.append(msg.get("record", msg))
-            elif msg_type in ("SCHEMA", "STATE"):
-                continue  # Singer metadata — skip
-            else:
-                # Plain NDJSON record with no Singer envelope
-                batch.append(msg)
+    total_rows = len(df)
+    logger.info("Loaded %d rows for stream '%s'; processing in chunks of %d", total_rows, stream, chunk_size)
 
-            if len(batch) >= chunk_size:
-                yield pd.DataFrame(batch)
-                batch = []
+    for start in range(0, total_rows, chunk_size):
+        yield df.iloc[start: start + chunk_size].copy()
 
-    if batch:
-        yield pd.DataFrame(batch)
+    # Release the full DataFrame after all slices are exhausted
+    del df
 
 
 def append_singer_records(
