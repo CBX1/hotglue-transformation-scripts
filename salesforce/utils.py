@@ -640,9 +640,10 @@ def append_singer_records(
 
     with open(output_path, mode, encoding="utf-8") as fh:
         if first_chunk:
-            # Accept string, integer, and number so strict Singer targets (e.g. Snowflake)
-            # don't reject sourceRecordId when the source JSON emits it as an integer.
-            properties = {col: {"type": ["null", "string", "integer", "number"]} for col in df.columns}
+            # Accept all scalar JSON types so strict Singer targets don't coerce values.
+            # boolean is required so HubSpot boolean fields (e.g. hs_email_optout) are
+            # not cast to strings by the downstream loader.
+            properties = {col: {"type": ["null", "boolean", "string", "integer", "number"]} for col in df.columns}
             schema_msg = {
                 "type": "SCHEMA",
                 "stream": stream_name,
