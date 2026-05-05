@@ -53,8 +53,16 @@ class HubSpotHandler(BaseETLHandler):
         "crmListMembershipDetails",
         "updatedAt",
         "pendingCriticalFieldsForCrmSync",
-        "globalUnsubscribe"
-        
+        "globalUnsubscribe",
+    }
+
+    # HubSpot company properties that are read-only and must not be pushed
+    COMPANY_READ_ONLY_FIELDS: Set[str] = {
+        "createdate",
+        "hs_lastmodifieddate",
+        "hs_object_id",
+        "updatedAt",
+        "pendingCriticalFieldsForCrmSync",
     }
 
     def __init__(self, *args, target_config: Optional[Dict] = None, **kwargs):
@@ -73,30 +81,27 @@ class HubSpotHandler(BaseETLHandler):
     def handle_write(self) -> None:
         """
         Handle the write operation for HubSpot.
-        
-        This method:
-        1. Processes the contacts stream from the source
-        2. Applies HubSpot-specific transformations
-        3. Writes transformed contact data in HubSpot-compatible format
-        
-        Policy: Write jobs only push Contacts. Companies and other objects are not
-        written from this pipeline. Association handling is delegated to HubSpot's
-        internal systems.
+
+        Writes contacts unconditionally. Writes accounts (HubSpot companies) only when
+        a tenant mapping for accounts is present in stream_name_mapping — enabling
+        per-tenant opt-in without a feature flag. Association handling is delegated to
+        HubSpot's internal systems.
         """
         if not self.mapping_for_flow:
             raise ValueError("No write mapping found for HubSpot flow")
-        
+
         mapping = self.build_write_mapping()
         streams = self.list_available_streams()
-        
-        logger.info(f"HubSpot write: evaluating {len(streams)} streams; only 'contacts' will be written")
-        
+
+        logger.info(f"HubSpot write: evaluating {len(streams)} streams")
+
         for stream in streams:
             if stream == "contacts":
-                # Contacts are the only object we write to HubSpot
                 self._handle_contacts_write(mapping)
+            elif stream == "accounts":
+                self._handle_accounts_write(mapping)
             else:
-                logger.info(f"HubSpot write: skipping non-contact stream '{stream}' by policy")
+                logger.info(f"HubSpot write: skipping stream '{stream}' by policy")
     
     def _handle_passthrough_stream(self, stream: str) -> None:
         """
@@ -170,7 +175,6 @@ class HubSpotHandler(BaseETLHandler):
         # Filter out already sent records
         # Read the CSV snapshot directly (with flow_id suffix) to avoid loading
         # the parquet snapshot which may contain mixed READ/WRITE data
-        import gluestick as gs
         snapshot_name = f"{self.stream_name_mapping[mapping_name]}_{self.flow_id}"
         sent_contacts = gs.read_snapshots(snapshot_name, self.snapshot_dir)
         df_out = drop_sent_records("contacts", df_out, sent_contacts, None)
@@ -186,6 +190,42 @@ class HubSpotHandler(BaseETLHandler):
         # (CB-7840: CRM Sync Approval System gates critical field changes)
         self._handle_global_unsubscribe(contacts_df_raw)
     
+    def _handle_accounts_write(self, mapping: Dict) -> None:
+        """
+        Handle accounts write for HubSpot (maps to HubSpot companies object).
+
+        Opt-in per tenant: if no accounts mapping exists in stream_name_mapping
+        (i.e., the backend has not configured TenantEgestionMapping for ACCOUNT→HUBSPOT
+        for this tenant), the stream is skipped gracefully.
+        """
+        if "accounts" not in self.stream_name_mapping:
+            logger.info("No accounts mapping configured for this tenant, skipping accounts write")
+            return
+
+        logger.info("Processing accounts (companies) for HubSpot")
+
+        accounts_df = self.get_stream_data("accounts")
+        if accounts_df is None or accounts_df.empty:
+            logger.info("No account records to write")
+            return
+
+        accounts_df = accounts_df.drop(columns=list(self.COMPANY_READ_ONLY_FIELDS), errors="ignore")
+
+        df_out = accounts_df.copy()
+
+        # drop_sent_records requires externalId; the egestion mapping emits it ($.id→$.externalId)
+        # but guard defensively in case of misconfigured mappings
+        if "externalId" not in df_out.columns:
+            df_out["externalId"] = df_out["id"] if "id" in df_out.columns else None
+
+        # Snapshot is written back by HotGlue's target connector after upsert (same as contacts)
+        snapshot_name = f"{self.stream_name_mapping['accounts']}_{self.flow_id}"
+        sent_accounts = gs.read_snapshots(snapshot_name, self.snapshot_dir)
+        df_out = drop_sent_records("accounts", df_out, sent_accounts, None)
+
+        self.write_to_singer(df_out, self.stream_name_mapping["accounts"])
+        logger.info(f"Processed {len(df_out)} account records for HubSpot")
+
     def _handle_global_unsubscribe(self, contacts_df: pd.DataFrame) -> None:
         """
         Handle global unsubscribe for contacts with globalUnsubscribe field set to true.
