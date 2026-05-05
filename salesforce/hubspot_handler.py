@@ -65,6 +65,15 @@ class HubSpotHandler(BaseETLHandler):
         "pendingCriticalFieldsForCrmSync",
     }
 
+    # Columns required by _handle_global_unsubscribe — kept here so both the caller
+    # (which slims the raw DataFrame) and the method stay in sync.
+    UNSUBSCRIBE_REQUIRED_COLS: Set[str] = {
+        "globalUnsubscribe",
+        "pendingCriticalFieldsForCrmSync",
+        "rejectionReason",
+        "email",
+    }
+
     def __init__(self, *args, target_config: Optional[Dict] = None, **kwargs):
         """
         Initialize the HubSpot handler.
@@ -159,8 +168,11 @@ class HubSpotHandler(BaseETLHandler):
 
         # Slim the raw DataFrame to only the columns needed by the unsubscribe handler
         # before dropping read-only fields, so we can free the full raw copy early.
-        _unsub_cols = {"globalUnsubscribe", "pendingCriticalFieldsForCrmSync", "rejectionReason", "email"}
-        contacts_for_unsub = contacts_df_raw[[c for c in _unsub_cols if c in contacts_df_raw.columns]]
+        # .copy() is required: column-subset indexing returns a view, so without it
+        # del contacts_df_raw below would not actually release the backing memory block.
+        contacts_for_unsub = contacts_df_raw[
+            [c for c in self.UNSUBSCRIBE_REQUIRED_COLS if c in contacts_df_raw.columns]
+        ].copy()
 
         # Remove HubSpot read-only fields; drop() returns a new DataFrame — no copy() needed.
         df_out = contacts_df_raw.drop(columns=list(self.READ_ONLY_FIELDS), errors="ignore")
