@@ -175,7 +175,6 @@ class HubSpotHandler(BaseETLHandler):
         # Filter out already sent records
         # Read the CSV snapshot directly (with flow_id suffix) to avoid loading
         # the parquet snapshot which may contain mixed READ/WRITE data
-        import gluestick as gs
         snapshot_name = f"{self.stream_name_mapping[mapping_name]}_{self.flow_id}"
         sent_contacts = gs.read_snapshots(snapshot_name, self.snapshot_dir)
         df_out = drop_sent_records("contacts", df_out, sent_contacts, None)
@@ -214,6 +213,12 @@ class HubSpotHandler(BaseETLHandler):
 
         df_out = accounts_df.copy()
 
+        # drop_sent_records requires externalId; the egestion mapping emits it ($.id→$.externalId)
+        # but guard defensively in case of misconfigured mappings
+        if "externalId" not in df_out.columns:
+            df_out["externalId"] = df_out["id"] if "id" in df_out.columns else None
+
+        # Snapshot is written back by HotGlue's target connector after upsert (same as contacts)
         snapshot_name = f"{self.stream_name_mapping['accounts']}_{self.flow_id}"
         sent_accounts = gs.read_snapshots(snapshot_name, self.snapshot_dir)
         df_out = drop_sent_records("accounts", df_out, sent_accounts, None)
