@@ -744,16 +744,19 @@ class HubSpotHandler(BaseETLHandler):
             lookup_field = "domain"
         else:
             logger.warning(f"Unknown stream '{stream}' for record wrapping")
-            return df
+            return pd.DataFrame(columns=["data", "sourceRecordId", "source", "lookupKey"])
 
-        # Check if required fields exist
+        # Check if required fields exist — return an empty wrapped-schema DataFrame so that
+        # handle_read skips the chunk without emitting an unwrapped SCHEMA that would poison
+        # all subsequent correctly-wrapped chunks.
+        _WRAPPED_COLS = ["data", "sourceRecordId", "source", "lookupKey"]
         if "id" not in df.columns:
-            logger.warning(f"Missing 'id' field in {stream}, cannot wrap records")
-            return df
+            logger.warning(f"Missing 'id' field in {stream}, skipping chunk")
+            return pd.DataFrame(columns=_WRAPPED_COLS)
 
         if lookup_field not in df.columns:
-            logger.warning(f"Missing '{lookup_field}' field in {stream}, cannot wrap records")
-            return df
+            logger.warning(f"Missing '{lookup_field}' field in {stream}, skipping chunk")
+            return pd.DataFrame(columns=_WRAPPED_COLS)
 
         # Filter out records with null lookup key (email or domain)
         df = df.copy()

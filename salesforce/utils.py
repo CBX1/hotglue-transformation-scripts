@@ -539,7 +539,7 @@ def iter_stream_chunks(
                 batch.append(msg["record"])
                 if len(batch) >= chunk_size:
                     yield pd.DataFrame(batch)
-                    batch.clear()
+                    batch = []
 
     if batch:
         yield pd.DataFrame(batch)
@@ -566,7 +566,9 @@ def append_singer_records(
 
     with open(output_path, mode, encoding="utf-8") as fh:
         if first_chunk:
-            properties = {col: {"type": ["null", "string"]} for col in df.columns}
+            # Accept string, integer, and number so strict Singer targets (e.g. Snowflake)
+            # don't reject sourceRecordId when the source JSON emits it as an integer.
+            properties = {col: {"type": ["null", "string", "integer", "number"]} for col in df.columns}
             schema_msg = {
                 "type": "SCHEMA",
                 "stream": stream_name,
