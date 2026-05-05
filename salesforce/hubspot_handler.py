@@ -819,6 +819,10 @@ class HubSpotHandler(BaseETLHandler):
             return obj.item()
         elif isinstance(obj, np.bool_):
             return bool(obj)
+        elif isinstance(obj, str) and obj.lower() in ("true", "false"):
+            # HubSpot API returns boolean properties as strings ("true"/"false").
+            # Coerce to Python bool so json.dumps emits a JSON boolean, not a string.
+            return obj.lower() == "true"
         else:
             return obj
  
