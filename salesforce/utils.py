@@ -502,6 +502,30 @@ def get_contact_data(
 READ_CHUNK_SIZE = 10_000
 
 
+def _find_stream_file(input_dir: str, stream: str) -> Optional[str]:
+    """
+    Locate a stream data file by trying common extensions used by HotGlue tap targets.
+
+    Returns the first matching path, or None. Logs available directory contents
+    when no match is found to aid diagnosis of new naming conventions.
+    """
+    for ext in (".singer", ".json", ".jsonl", ""):
+        candidate = os.path.join(input_dir, f"{stream}{ext}")
+        if os.path.exists(candidate):
+            return candidate
+
+    try:
+        available = sorted(os.listdir(input_dir))
+    except OSError:
+        available = ["<unreadable>"]
+    logger.warning(
+        "No data file found for stream '%s' in %s. "
+        "Available files: %s",
+        stream, input_dir, available,
+    )
+    return None
+
+
 def iter_stream_chunks(
     input_dir: str,
     stream: str,
@@ -510,22 +534,23 @@ def iter_stream_chunks(
     """
     Yield DataFrames of at most chunk_size rows from a Singer stream file.
 
-    Reads the .singer file line-by-line so the full stream is never held in
-    memory at once — peak memory is bounded to chunk_size rows × column count
-    regardless of total dataset size.
+    Reads the file line-by-line so the full stream is never held in memory at
+    once — peak memory is bounded to chunk_size rows × column count regardless
+    of total dataset size.
 
-    Yields nothing and logs a warning when the stream file is absent.
+    Supports two line formats found in HotGlue sync-output directories:
+    - Singer-wrapped: {"type":"RECORD","stream":"...","record":{...}}
+    - Plain NDJSON:   {"id":"1","name":"...",...}
+
+    Tries common file extensions (.singer, .json, .jsonl, no extension) and
+    logs directory contents when no file is found.
     """
-    singer_file = os.path.join(input_dir, f"{stream}.singer")
-    if not os.path.exists(singer_file):
-        logger.warning(
-            "Singer file not found for stream '%s' in %s; no chunks to iterate",
-            stream, input_dir,
-        )
+    stream_file = _find_stream_file(input_dir, stream)
+    if stream_file is None:
         return
 
     batch: list = []
-    with open(singer_file, "r", encoding="utf-8") as fh:
+    with open(stream_file, "r", encoding="utf-8") as fh:
         for raw in fh:
             raw = raw.strip()
             if not raw:
@@ -533,13 +558,25 @@ def iter_stream_chunks(
             try:
                 msg = _json.loads(raw)
             except _json.JSONDecodeError:
-                logger.debug("Skipping malformed Singer line in %s", singer_file)
+                logger.debug("Skipping malformed line in %s", stream_file)
                 continue
-            if msg.get("type") == "RECORD" and msg.get("stream") == stream:
-                batch.append(msg["record"])
-                if len(batch) >= chunk_size:
-                    yield pd.DataFrame(batch)
-                    batch = []
+            if not isinstance(msg, dict):
+                continue
+
+            msg_type = msg.get("type")
+            if msg_type == "RECORD":
+                # Singer format — HotGlue dedicates one file per stream so no
+                # stream-name filter is needed, but accept it as extra safety.
+                batch.append(msg.get("record", msg))
+            elif msg_type in ("SCHEMA", "STATE"):
+                continue  # Singer metadata — skip
+            else:
+                # Plain NDJSON record with no Singer envelope
+                batch.append(msg)
+
+            if len(batch) >= chunk_size:
+                yield pd.DataFrame(batch)
+                batch = []
 
     if batch:
         yield pd.DataFrame(batch)
