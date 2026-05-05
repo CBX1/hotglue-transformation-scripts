@@ -65,6 +65,15 @@ class HubSpotHandler(BaseETLHandler):
         "pendingCriticalFieldsForCrmSync",
     }
 
+    # Columns required by _handle_global_unsubscribe — kept here so both the caller
+    # (which slims the raw DataFrame) and the method stay in sync.
+    UNSUBSCRIBE_REQUIRED_COLS: Set[str] = {
+        "globalUnsubscribe",
+        "pendingCriticalFieldsForCrmSync",
+        "rejectionReason",
+        "email",
+    }
+
     def __init__(self, *args, target_config: Optional[Dict] = None, **kwargs):
         """
         Initialize the HubSpot handler.
@@ -153,42 +162,35 @@ class HubSpotHandler(BaseETLHandler):
             mapping: Field mapping configuration
         """
         logger.info("Processing contacts for HubSpot")
-        
-        # Get contact data
+
         contacts_df_raw = self.get_stream_data("contacts")
-
-        
-        # Apply mapping for contacts
         mapping_name = "contacts"
-        stream_columns=contacts_df_raw.columns
 
-        # Remove HubSpot read-only fields so we never attempt to update them
-        # Filter from stream_columns list
-        stream_columns = [col for col in stream_columns if col not in self.READ_ONLY_FIELDS]
-        # Also drop directly from DataFrame to catch any columns not tracked in stream_columns
-        contacts_df = contacts_df_raw.drop(columns=list(self.READ_ONLY_FIELDS), errors="ignore")
+        # Slim the raw DataFrame to only the columns needed by the unsubscribe handler
+        # before dropping read-only fields, so we can free the full raw copy early.
+        # .copy() is required: column-subset indexing returns a view, so without it
+        # del contacts_df_raw below would not actually release the backing memory block.
+        contacts_for_unsub = contacts_df_raw[
+            [c for c in self.UNSUBSCRIBE_REQUIRED_COLS if c in contacts_df_raw.columns]
+        ].copy()
 
-    
-
-        df_out = contacts_df.copy()
+        # Remove HubSpot read-only fields; drop() returns a new DataFrame — no copy() needed.
+        df_out = contacts_df_raw.drop(columns=list(self.READ_ONLY_FIELDS), errors="ignore")
+        del contacts_df_raw
 
         # Filter out already sent records
-        # Read the CSV snapshot directly (with flow_id suffix) to avoid loading
-        # the parquet snapshot which may contain mixed READ/WRITE data
         snapshot_name = f"{self.stream_name_mapping[mapping_name]}_{self.flow_id}"
         sent_contacts = gs.read_snapshots(snapshot_name, self.snapshot_dir)
         df_out = drop_sent_records("contacts", df_out, sent_contacts, None)
-        
-        
-        
+
         # Write to output
         self.write_to_singer(df_out, self.stream_name_mapping[mapping_name])
         logger.info(f"Processed {len(df_out)} contact records for HubSpot")
-                
+
         # Call unsubscribe API for contacts with globalUnsubscribe=true
         # Only processes contacts where globalUnsubscribe is NOT pending approval or rejected
         # (CB-7840: CRM Sync Approval System gates critical field changes)
-        self._handle_global_unsubscribe(contacts_df_raw)
+        self._handle_global_unsubscribe(contacts_for_unsub)
     
     def _handle_accounts_write(self, mapping: Dict) -> None:
         """
@@ -209,9 +211,9 @@ class HubSpotHandler(BaseETLHandler):
             logger.info("No account records to write")
             return
 
-        accounts_df = accounts_df.drop(columns=list(self.COMPANY_READ_ONLY_FIELDS), errors="ignore")
-
-        df_out = accounts_df.copy()
+        # drop() returns a new DataFrame — no copy() needed.
+        df_out = accounts_df.drop(columns=list(self.COMPANY_READ_ONLY_FIELDS), errors="ignore")
+        del accounts_df
 
         # drop_sent_records requires externalId; the egestion mapping emits it ($.id→$.externalId)
         # but guard defensively in case of misconfigured mappings
