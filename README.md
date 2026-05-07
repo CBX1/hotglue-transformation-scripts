@@ -40,14 +40,18 @@ The system supports two job types:
 ## Directory Structure
 
 ```
-salesforce/
-├── etl.py              # Main transformation script
-├── utils.py            # Utility functions
-├── requirements.txt    # Python dependencies
-├── sync-output/        # Input data from HotGlue
-├── snapshots/          # Tracking previously sent records
-├── etl-output/         # Output data in Singer format
-└── config.json         # Tap configuration (optional)
+.
+├── etl.py                  # Main orchestrator/entrypoint
+├── base_handler.py         # Abstract base for connector handlers
+├── salesforce_handler.py   # Salesforce write/read business logic
+├── hubspot_handler.py      # HubSpot write/read business logic
+├── marketo_handler.py      # Marketo write/read business logic
+├── utils.py                # Shared helpers
+├── requirements.txt        # Python dependencies
+├── .hotgluerc              # HotGlue flow/env/tap config
+├── sync-output/            # Input data from HotGlue
+├── snapshots/              # Tracking previously sent records
+└── etl-output/             # Output data in Singer format
 ```
 
 ## Configuration

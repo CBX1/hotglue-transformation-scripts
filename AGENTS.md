@@ -34,7 +34,7 @@ python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Run jobs from the `salesforce/` directory by exporting the required environment variables:
+Run jobs from the repository root by exporting the required environment variables:
 
 - `JOB_TYPE`: `write` (to CRM) or `read` (from CRM to DW). Default: `write`.
 - `FLOW`: Flow identifier used for mapping/snapshots. Example: `AJ3x0LMYI`.
