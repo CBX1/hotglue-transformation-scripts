@@ -1,0 +1,95 @@
+name: Deploy ETL to HotGlue
+
+run-name: >-
+  Deploy →
+  ${{ github.event.inputs.environment ||
+      (github.ref_name == 'production' && 'prod.different.ai' || 'dev.different.ai') }}
+  (${{ github.ref_name }})
+
+on:
+  push:
+    branches: [main, production]
+    # Skip doc-only changes; everything else at the repo root affects the deploy.
+    paths-ignore:
+      - 'README.md'
+      - 'AGENTS.md'
+      - 'CLAUDE.md'
+      - 'GEMINI.md'
+      - '.gitignore'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target HotGlue environment'
+        required: true
+        default: 'dev.different.ai'
+        type: choice
+        options:
+          - dev.different.ai
+          - prod.different.ai
+
+permissions:
+  contents: read
+
+# Serialize by resolved target env so concurrent prod deploys (push to
+# `production` and a manual dispatch from production) cannot interleave.
+concurrency:
+  group: >-
+    deploy-${{ github.event.inputs.environment ||
+               (github.ref_name == 'production' && 'prod.different.ai' || 'dev.different.ai') }}
+  cancel-in-progress: false
+
+jobs:
+  guard:
+    name: Guard manual prod dispatch
+    runs-on: [self-hosted, cbx1-gcp-runner-small]
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Reject prod dispatch from non-production ref
+        if: >-
+          github.event.inputs.environment == 'prod.different.ai' &&
+          github.ref != 'refs/heads/production'
+        run: |
+          echo "::error::workflow_dispatch with environment=prod.different.ai is only allowed from the 'production' branch (current ref: ${GITHUB_REF})."
+          exit 1
+
+  deploy:
+    name: Deploy to HotGlue
+    runs-on: [self-hosted, cbx1-gcp-runner-small]
+    needs: [guard]
+    # `guard` is skipped for push events (its `if:` evaluates false), so accept
+    # either success or skipped here.
+    if: |
+      always() &&
+      (needs.guard.result == 'success' || needs.guard.result == 'skipped')
+    timeout-minutes: 15
+    env:
+      HOTGLUE_ENV: >-
+        ${{ github.event.inputs.environment ||
+            (github.ref_name == 'production' && 'prod.different.ai' || 'dev.different.ai') }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+
+      - name: Verify secret is set
+        env:
+          HOTGLUE_API_KEY: ${{ secrets.HOTGLUE_API_KEY }}
+        run: |
+          if [ -z "$HOTGLUE_API_KEY" ]; then
+            echo "::error::HOTGLUE_API_KEY repository secret is not set"
+            exit 1
+          fi
+          echo "Deploying to $HOTGLUE_ENV (ref ${GITHUB_REF_NAME})"
+
+      - name: Deploy ETL
+        env:
+          HOTGLUE_API_KEY: ${{ secrets.HOTGLUE_API_KEY }}
+        run: |
+          npx -y @hotglue/cli@1.1.0 etl deploy \
+            --sourceFolder . \
+            --environment "$HOTGLUE_ENV" \
+            --apikey "$HOTGLUE_API_KEY"
