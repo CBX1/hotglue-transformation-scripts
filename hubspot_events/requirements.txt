@@ -1,0 +1,3 @@
+gluestick
+pandas
+numpy
