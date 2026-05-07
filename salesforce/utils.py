@@ -619,6 +619,42 @@ def _iter_record_stream_chunks(
         yield pd.DataFrame(batch)
 
 
+_BASE_SCALAR_TYPES = ["null", "boolean", "string", "integer", "number"]
+
+
+def _detect_singer_col_type(series: "pd.Series", sample_size: int = 100) -> list:
+    """Return Singer JSON Schema type list for a column based on observed values.
+
+    Probes up to ``sample_size`` non-null values. If any are dict, "object" is added;
+    if any are list, "array" is added. Scalar columns get the permissive base set so
+    boolean / numeric / string values aren't coerced by downstream loaders.
+
+    Manual iteration (rather than pd.isna) avoids the elementwise-NaN check blowing
+    up on unhashable dict/list values in object-dtype columns.
+    """
+    has_dict = False
+    has_list = False
+    seen = 0
+    for v in series:
+        if v is None:
+            continue
+        if isinstance(v, float) and pd.isna(v):
+            continue
+        if isinstance(v, dict):
+            has_dict = True
+        elif isinstance(v, list):
+            has_list = True
+        seen += 1
+        if seen >= sample_size and (has_dict or has_list):
+            break
+    types = list(_BASE_SCALAR_TYPES)
+    if has_dict:
+        types.append("object")
+    if has_list:
+        types.append("array")
+    return types
+
+
 def append_singer_records(
     df: pd.DataFrame,
     stream_name: str,
@@ -632,18 +668,22 @@ def append_singer_records(
     is prepended; subsequent calls open in append mode and emit RECORDs only —
     so the schema appears exactly once even across many chunks.
 
-    Object / dict values are serialised to JSON strings to match gluestick's
-    allow_objects=True behaviour. Null values are omitted from each record.
+    Columns containing dict / list values are declared with ``object`` / ``array``
+    types in the SCHEMA so nested values flow through to downstream consumers as
+    real JSON structures. Null values are omitted from each record.
     """
     output_path = os.path.join(output_dir, f"{stream_name}.singer")
     mode = "w" if first_chunk else "a"
 
     with open(output_path, mode, encoding="utf-8") as fh:
         if first_chunk:
-            # Accept all scalar JSON types so strict Singer targets don't coerce values.
-            # boolean is required so HubSpot boolean fields (e.g. hs_email_optout) are
-            # not cast to strings by the downstream loader.
-            properties = {col: {"type": ["null", "boolean", "string", "integer", "number"]} for col in df.columns}
+            # Per-column type detection. boolean is required so HubSpot boolean
+            # fields (e.g. hs_email_optout) are not cast to strings by the
+            # downstream loader; object/array are required so wrapper columns
+            # like ``data`` round-trip as navigable JSON instead of TextNodes.
+            properties = {
+                col: {"type": _detect_singer_col_type(df[col])} for col in df.columns
+            }
             schema_msg = {
                 "type": "SCHEMA",
                 "stream": stream_name,
@@ -657,8 +697,11 @@ def append_singer_records(
             for k, v in record.items():
                 if v is None or (isinstance(v, float) and pd.isna(v)):
                     continue
-                # Serialise nested objects to JSON strings (gluestick allow_objects=True parity)
-                clean[k] = _json.dumps(v, default=str) if isinstance(v, (dict, list)) else v
+                clean[k] = v
             fh.write(
-                _json.dumps({"type": "RECORD", "stream": stream_name, "record": clean}) + "\n"
+                _json.dumps(
+                    {"type": "RECORD", "stream": stream_name, "record": clean},
+                    default=str,
+                )
+                + "\n"
             )
