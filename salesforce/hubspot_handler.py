@@ -457,6 +457,7 @@ class HubSpotHandler(BaseETLHandler):
         # Build small lookup tables once — these stay in memory throughout (< 1 MB each)
         owner_lookup = self._prepare_owner_lookup(data_streams)
         list_lookup = self._prepare_list_lookup(data_streams)
+        account_lookup = self._prepare_account_lookup()
 
         inverse_mapping = {v: k for k, v in self.stream_name_mapping.items()}
         target_streams = [s for s in data_streams if s in {"contacts", "companies"}]
@@ -473,6 +474,8 @@ class HubSpotHandler(BaseETLHandler):
                     continue
 
                 chunk_df, owner_column = self._apply_read_mapping(chunk_df, stream)
+                if stream == "contacts":
+                    chunk_df = self._resolve_contact_account_ids(chunk_df, account_lookup)
                 chunk_df = self._merge_owner_details(chunk_df, owner_lookup, owner_column)
                 chunk_df = self._populate_list_memberships(chunk_df, stream, list_lookup)
                 chunk_df = self._wrap_records_with_metadata(chunk_df, stream)
@@ -540,6 +543,68 @@ class HubSpotHandler(BaseETLHandler):
 
         logger.info(f"Created owner lookup with {len(lookup)} entries")
         return lookup
+
+    def _prepare_account_lookup(self) -> Optional[Dict[str, str]]:
+        """
+        Build a HubSpot company id -> CBX1 account UUID lookup from the accounts snapshot.
+
+        The accounts snapshot is written by the HubSpot read path of an earlier run when
+        `accounts` (HubSpot companies) flow into CBX1, so its convention is:
+          - InputId  = HubSpot company id (numeric, as a string)
+          - RemoteId = CBX1 account UUID
+        This is the *opposite* of the Salesforce write-path snapshot (InputId=CBX1,
+        RemoteId=SF). Do not generalize across connectors without re-checking the file.
+
+        Returns None when the snapshot is missing or unusable; callers must treat that as
+        "no translation possible" and emit accountId=None for every contact in the chunk.
+        """
+        snap = self.read_snapshot("accounts")
+        if snap is None or snap.empty:
+            logger.info("No accounts snapshot found; contacts will be emitted with accountId=None")
+            return None
+        if "InputId" not in snap.columns or "RemoteId" not in snap.columns:
+            logger.warning(
+                "Accounts snapshot missing InputId/RemoteId columns (found: %s); "
+                "contacts will be emitted with accountId=None",
+                list(snap.columns),
+            )
+            return None
+
+        lookup = {
+            str(hs_id): str(cbx_id)
+            for hs_id, cbx_id in zip(snap["InputId"], snap["RemoteId"])
+            if pd.notna(hs_id) and pd.notna(cbx_id)
+        }
+        logger.info("Built HubSpot company -> CBX1 account lookup with %d entries", len(lookup))
+        return lookup
+
+    def _resolve_contact_account_ids(
+        self, df: pd.DataFrame, account_lookup: Optional[Dict[str, str]]
+    ) -> pd.DataFrame:
+        """
+        Translate `associatedcompanyid` (HubSpot company id) to `accountId` (CBX1 UUID).
+
+        Sets accountId=None for contacts whose associatedcompanyid is missing or absent
+        from the snapshot — the backend's own fallback (companyName/domain/email-domain)
+        can still kick in downstream. associatedcompanyid is dropped after translation
+        so the wrapped Singer payload does not leak the raw HubSpot id.
+        """
+        if df is None or df.empty:
+            return df
+
+        if "associatedcompanyid" not in df.columns or not account_lookup:
+            df["accountId"] = None
+        else:
+            company_ids = df["associatedcompanyid"].astype("string")
+            df["accountId"] = company_ids.map(account_lookup).where(
+                company_ids.notna() & company_ids.isin(account_lookup), None
+            )
+
+        df = df.drop(columns=["associatedcompanyid"], errors="ignore")
+
+        resolved = df["accountId"].notna().sum() if "accountId" in df.columns else 0
+        logger.info("Resolved accountId for %d/%d contacts in chunk", resolved, len(df))
+        return df
 
     def _prepare_list_lookup(self, streams: List[str]) -> Optional[Dict[str, str]]:
         """
@@ -693,7 +758,8 @@ class HubSpotHandler(BaseETLHandler):
             # Add hubspot_owner_id column if not present
             df["hubspot_owner_id"] = None
 
-        # Preserve associatedcompanyid for contacts so we can derive accountId later
+        # Ensure associatedcompanyid exists on contacts; _resolve_contact_account_ids
+        # consumes it to derive accountId and drops it before wrapping.
         if stream == "contacts":
             if "associatedcompanyid" not in df.columns:
                 df["associatedcompanyid"] = None
