@@ -662,18 +662,20 @@ def append_singer_records(
     first_chunk: bool,
 ) -> None:
     """
-    Append Singer RECORD messages to the output file for stream_name.
+    Append Singer RECORD messages to the shared ``data.singer`` output file.
 
-    On first_chunk=True the file is created (or truncated) and a SCHEMA message
-    is prepended; subsequent calls open in append mode and emit RECORDs only —
-    so the schema appears exactly once even across many chunks.
+    All streams share a single output file (matching the gluestick.to_singer
+    convention) so that the downstream target ingests every stream from one
+    payload. The file is created on the first write and appended thereafter;
+    when ``first_chunk=True`` a SCHEMA message is prepended so each stream's
+    schema appears exactly once even across many chunks and multiple streams.
 
     Columns containing dict / list values are declared with ``object`` / ``array``
     types in the SCHEMA so nested values flow through to downstream consumers as
     real JSON structures. Null values are omitted from each record.
     """
-    output_path = os.path.join(output_dir, f"{stream_name}.singer")
-    mode = "w" if first_chunk else "a"
+    output_path = os.path.join(output_dir, "data.singer")
+    mode = "a" if os.path.isfile(output_path) else "w"
 
     with open(output_path, mode, encoding="utf-8") as fh:
         if first_chunk:
