@@ -93,4 +93,5 @@ jobs:
             --sourceFolder ./hubspot \
             --env "$HOTGLUE_ENV" \
             --flow AJ3x0LMYI \
+            --tap hubspot \
             --apikey "$HOTGLUE_API_KEY"
