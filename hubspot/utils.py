@@ -184,45 +184,49 @@ def drop_sent_records(
 ) -> pd.DataFrame:
     """
     Filter out records that have already been sent to prevent duplicates.
-    
-    This deduplication function compares current data against historical snapshots
-    to identify records that have not been sent yet. For contacts, it also
-    includes records that have been updated since the last sync.
-    
+
+    Compares current data against historical snapshots to keep only records that
+    have not been sent yet. When a ``new_data`` frame is supplied, records present
+    in it are re-included even if they appear in ``sent_data`` — this is the
+    "record changed since last sync" branch used by contacts and accounts.
+
     Args:
         stream: Name of the data stream being processed (e.g., 'contacts', 'accounts')
         stream_data: DataFrame containing the current batch of data
         sent_data: DataFrame containing previously sent records from snapshots
-        new_data: Optional DataFrame containing records with updates (used for contacts)
-        
+        new_data: Optional DataFrame of records flagged as updated. When provided,
+            any record whose ``externalId`` is in it bypasses the sent-records
+            filter so content changes propagate to the target.
+
     Returns:
         DataFrame containing only records that haven't been sent or have updates
-        
+
     Raises:
         ValueError: If required ID columns are missing
-        
+
     Note:
         - Uses 'externalId' in stream_data and 'InputId' in sent_data for comparison
-        - For contacts stream, includes updated records even if previously sent
+        - The "re-include updated records" branch applies to any stream that
+          supplies ``new_data`` (previously contacts-only; extended to fix the
+          accounts write-once bug where field updates never reached the CRM).
     """
     # If no sent data, return all stream data
     if sent_data is None:
         return stream_data
-    
+
     # Validate required columns exist
     if "externalId" not in stream_data.columns:
         raise ValueError("externalId column is required in stream_data")
-    
+
     if "InputId" not in sent_data.columns:
         raise ValueError("InputId column is required in sent_data")
-    
+
     # Filter out records that have already been sent
     condition = ~stream_data["externalId"].isin(sent_data["InputId"])
 
-    # For contacts stream, also include records with updates
-    if stream == "contacts" and new_data is not None:
-        if "externalId" in new_data.columns:
-            condition = condition | (stream_data["externalId"].isin(new_data["externalId"]))
+    # Re-include records flagged as updated (content has changed since last sync).
+    if new_data is not None and "externalId" in new_data.columns:
+        condition = condition | (stream_data["externalId"].isin(new_data["externalId"]))
 
     return stream_data.loc[condition].copy()
 
