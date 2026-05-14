@@ -90,6 +90,8 @@ jobs:
           HOTGLUE_API_KEY: ${{ secrets.HOTGLUE_API_KEY }}
         run: |
           npx -y @hotglue/cli@1.1.0 etl deploy \
-            --sourceFolder . \
-            --environment "$HOTGLUE_ENV" \
+            --sourceFolder ./hubspot \
+            --env "$HOTGLUE_ENV" \
+            --flow AJ3x0LMYI \
+            --tap hubspot \
             --apikey "$HOTGLUE_API_KEY"

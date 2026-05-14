@@ -227,7 +227,19 @@ class HubSpotHandler(BaseETLHandler):
         # Snapshot is written back by HotGlue's target connector after upsert (same as contacts)
         snapshot_name = f"{self.stream_name_mapping['accounts']}_{self.flow_id}"
         sent_accounts = gs.read_snapshots(snapshot_name, self.snapshot_dir)
-        df_out = drop_sent_records("accounts", df_out, sent_accounts, None)
+
+        # Identify records whose hashed payload changed since the last sync. Passing the
+        # changed frame as new_data re-includes updated accounts that drop_sent_records
+        # would otherwise drop on externalId match — the externalId-only dedup made the
+        # accounts write path write-once and silently swallowed CBX1 updates.
+        changed_accounts = gs.drop_redundant(
+            df_out.copy(),
+            f"{snapshot_name}.content",
+            self.snapshot_dir,
+            pk=["externalId"],
+            use_csv=True,
+        )
+        df_out = drop_sent_records("accounts", df_out, sent_accounts, changed_accounts)
 
         self.write_to_singer(df_out, self.stream_name_mapping["accounts"])
         logger.info(f"Processed {len(df_out)} account records for HubSpot")
