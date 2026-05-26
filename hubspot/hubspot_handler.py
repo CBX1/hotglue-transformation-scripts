@@ -860,6 +860,7 @@ class HubSpotHandler(BaseETLHandler):
         for record in records:
             # Clean the record data recursively
             cleaned_record = self._clean_record_for_serialization(record)
+            cleaned_record["source"] = "HUBSPOT"
 
             wrapped = {
                 "data": cleaned_record,

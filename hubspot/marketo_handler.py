@@ -198,6 +198,7 @@ class MarketoHandler(BaseETLHandler):
         wrapped_records = []
         for record in records:
             cleaned_record = self._clean_record_for_serialization(record)
+            cleaned_record["source"] = "MARKETO"
             wrapped = {
                 "data": cleaned_record,
                 "sourceRecordId": record.get("id"),
