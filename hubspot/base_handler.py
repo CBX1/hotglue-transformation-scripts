@@ -199,30 +199,12 @@ class BaseETLHandler(ABC):
         id_field: Optional[str] = None,
     ) -> pd.DataFrame:
         """
-        Wrap each record for the CBX1 ingest endpoint.
+        Wrap each flat record into the cbx1-target envelope
+        {data, sourceRecordId, source, lookupKey}. Records missing an id or a
+        usable lookupKey are dropped so the backend can always match.
 
-        Transforms each flat record into:
-            {
-                "data": {<all fields>},
-                "sourceRecordId": <CRM record id>,
-                "source": <CRM name, e.g. "SALESFORCE">,
-                "lookupKey": <email for contacts/leads, domain for accounts>,
-            }
-
-        This is the shape `cbx1-target` requires; records without a usable
-        ``lookupKey`` (or id) are filtered out so the backend can always match.
-        Connector-agnostic — HubSpot keeps its own private copy for now; new
-        connectors should use this shared implementation.
-
-        Args:
-            df: DataFrame of flat records to wrap
-            stream: Stream name (used to infer the default lookup field)
-            source: CRM source identifier injected as ``source``
-            lookup_field: Override for the lookup column; defaults to ``email``
-                for contact/lead streams and ``domain`` otherwise
-
-        Returns:
-            DataFrame with columns [data, sourceRecordId, source, lookupKey]
+        lookup_field defaults to ``email`` for contact/lead streams and
+        ``domain`` otherwise; id_field defaults to ``id``/``Id``.
         """
         wrapped_cols = ["data", "sourceRecordId", "source", "lookupKey"]
         if df is None or df.empty:

@@ -87,10 +87,8 @@ class SalesforceHandler(BaseETLHandler):
         """
         logger.info("Processing contacts with Contact/Lead split for Salesforce")
         
-        # Load previously-sent accounts for Contact/Lead linkage. A missing/empty
-        # snapshot must NOT block contacts (new orgs have no accounts yet): we proceed
-        # with an empty account set so that, with dynamic_contact_mapping enabled, every
-        # accountless contact is routed to Lead rather than being dropped.
+        # A missing/empty accounts snapshot must not block contacts: with
+        # dynamic_contact_mapping on, accountless contacts route to Lead instead.
         sent_accounts = self.read_snapshot(self.stream_name_mapping.get('accounts', 'Account'))
         if sent_accounts is None or sent_accounts.empty:
             logger.info(
@@ -114,9 +112,8 @@ class SalesforceHandler(BaseETLHandler):
             logger.info("Applying dynamic contact mapping (Contact/Lead split)")
             contacts_df, leads_df = split_contacts_by_account(contacts_df, sent_accounts)
 
-        # Build a connector-keyed write mapping so Contact and Lead retain distinct field
-        # maps. build_write_mapping() keys by CBX1 target ("contacts"), which collapses both
-        # Salesforce objects onto one entry and previously left Contact unmapped/unwritten.
+        # Connector-keyed mapping so Contact and Lead keep distinct field maps
+        # (build_write_mapping collapses both onto the `contacts` target).
         mapping_by_connector = {}
         for key, fields in self.mapping_for_flow.items():
             parts = key.split("/")
@@ -206,12 +203,8 @@ class SalesforceHandler(BaseETLHandler):
             logger.warning("No streams or mapping available for read operation")
             return
         
-        # Route each Salesforce connector stream -> CBX1 target stream, derived from the
-        # mapping keys ("accounts/Account", "contacts/Contact", "contacts/Lead"). We use this
-        # only for routing/scoping — NOT for field renaming. Like the HubSpot read path, the
-        # transformation passes raw Salesforce field names through and the backend owns the
-        # field mapping (TenantEnrichmentMapping). Multiple connector streams (Contact, Lead)
-        # collapse onto one CBX1 target (contacts), which stream_name_mapping cannot represent.
+        # Route connector streams (Account/Contact/Lead) to their CBX1 target from the mapping
+        # keys. Contact and Lead both map to `contacts`; the backend owns field mapping.
         connector_to_target = {}
         for key in self.mapping_for_flow:
             parts = key.split("/")
@@ -249,21 +242,17 @@ class SalesforceHandler(BaseETLHandler):
         stream_data = self._filter_deleted_records(stream_data)
 
         if output_stream == "accounts":
-            # Salesforce has no `domain` field, only `Website`; synthesise a clean `domain`
-            # so accounts get a usable lookupKey (HubSpot companies carry domain natively).
+            # Salesforce has no domain field; synthesise one from Website for the lookupKey.
             stream_data = self._derive_domain_from_website(stream_data)
             lookup_field = "domain"
         else:
-            # Contacts/Leads: resolve Salesforce AccountId -> CBX1 account id (as HubSpot does
-            # for associatedcompanyid). Lookup by the raw Salesforce Email field.
             stream_data = self._update_contact_account_ids(stream_data)
-            lookup_field = "Email"
+            lookup_field = "Email"  # contacts/leads match by email
 
         # Normalise any dot-notation fields into nested objects
         stream_data = transform_dot_notation_to_nested(stream_data)
 
-        # Wrap for the cbx1-target ingest endpoint: {data, sourceRecordId, source, lookupKey}.
-        # Raw Salesforce field names are preserved inside `data`; the backend maps them.
+        # Wrap for cbx1-target; raw Salesforce field names stay inside `data` for the backend to map.
         wrapped = self.wrap_records_with_metadata(
             stream_data, output_stream, source="SALESFORCE", id_field="Id", lookup_field=lookup_field
         )
@@ -306,8 +295,6 @@ class SalesforceHandler(BaseETLHandler):
             return host.lower() or None
 
         df = df.copy()
-        # Synthesise `domain` from the raw Salesforce `Website`; leave Website in place for
-        # the backend mapping to consume as it sees fit.
         df["domain"] = df["Website"].apply(_clean)
         return df
 
@@ -321,9 +308,8 @@ class SalesforceHandler(BaseETLHandler):
         Returns:
             DataFrame with updated account IDs
         """
-        # Read the raw Salesforce `AccountId`; resolve it to the CBX1 account id via the
-        # accounts snapshot and expose it as `accountId` (the field the backend expects),
-        # leaving the raw `AccountId` untouched.
+        # Resolve the raw Salesforce AccountId -> CBX1 account id via the accounts
+        # snapshot, exposed as `accountId`; the raw AccountId is left untouched.
         if df is None or df.empty or "AccountId" not in df.columns:
             return df
 
