@@ -124,17 +124,23 @@ class SalesforceHandler(BaseETLHandler):
         """
         logger.info("Processing contacts with Contact/Lead split for Salesforce")
         
-        # Check if we have sent accounts (required for contact processing)
+        # Load previously-sent accounts for Contact/Lead linkage. A missing/empty
+        # snapshot must NOT block contacts (new orgs have no accounts yet): we proceed
+        # with an empty account set so that, with dynamic_contact_mapping enabled, every
+        # accountless contact is routed to Lead rather than being dropped.
         sent_accounts = self.read_snapshot(self.stream_name_mapping.get('accounts', 'Account'))
-        if sent_accounts is None:
-            logger.warning("No accounts have been sent yet, skipping contacts export")
-            return
-        
-        # Prepare account data for joining
-        sent_accounts = sent_accounts.rename(
-            columns={"InputId": "AccountId", "RemoteId": "RemoteAccountId"}
-        )
-        sent_accounts = sent_accounts[sent_accounts["RemoteAccountId"].notna()]
+        if sent_accounts is None or sent_accounts.empty:
+            logger.info(
+                "No accounts sent yet; proceeding with contacts "
+                "(accountless contacts route to Lead when dynamic_contact_mapping is enabled)"
+            )
+            sent_accounts = pd.DataFrame(columns=["AccountId", "RemoteAccountId"])
+        else:
+            # Prepare account data for joining
+            sent_accounts = sent_accounts.rename(
+                columns={"InputId": "AccountId", "RemoteId": "RemoteAccountId"}
+            )
+            sent_accounts = sent_accounts[sent_accounts["RemoteAccountId"].notna()]
         
         # Get contact data
         contacts_df = self.get_stream_data("contacts")
@@ -263,18 +269,23 @@ class SalesforceHandler(BaseETLHandler):
         # Handle special case for contacts with account IDs
         if stream == "contacts":
             stream_data = self._update_contact_account_ids(stream_data)
-        
-        # Add CRM system identifier
-        stream_data = self._add_crm_system(stream_data)
-        
+
         # Transform dot notation to nested structures
         stream_data = transform_dot_notation_to_nested(stream_data)
-        
-        # Determine output stream name
+
+        # Determine output (CBX1) stream name
         inverse_mapping = {v: k for k, v in self.stream_name_mapping.items()}
         output_stream = inverse_mapping.get(stream, stream)
-        
-        self._write_read_output(stream_data, output_stream)
+
+        # Wrap for the cbx1-target ingest endpoint: {data, sourceRecordId, source, lookupKey}.
+        # Replaces the previous flat crmSystem/crmAssociationId emission, which cbx1-target
+        # cannot ingest (it requires a top-level lookupKey, like the HubSpot read path).
+        # `source` supersedes the old crmSystem column; sourceRecordId is the Salesforce Id
+        # carried as `remote_id` by build_read_mapping. The backend owns field mapping.
+        wrapped = self.wrap_records_with_metadata(
+            stream_data, output_stream, source="SALESFORCE", id_field="remote_id"
+        )
+        self._write_read_output(wrapped, output_stream)
     
     def _apply_read_mapping(self, df: pd.DataFrame, stream: str, mapping: Dict) -> pd.DataFrame:
         """
@@ -370,21 +381,6 @@ class SalesforceHandler(BaseETLHandler):
         df["accountId"] = df["cbx1_account_id"]
         df = df.drop(columns=["salesforce_account_id", "cbx1_account_id"], errors="ignore")
         
-        return df
-    
-    def _add_crm_system(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Add CRM system identifier to the data.
-        
-        Args:
-            df: DataFrame to add CRM system to
-            
-        Returns:
-            DataFrame with crmSystem column added
-        """
-        df = df.copy()
-        df["crmSystem"] = "SALESFORCE"
-        df = df.rename(columns={"remote_id": "crmAssociationId"})
         return df
     
     def _write_read_output(self, df: pd.DataFrame, stream_name: str) -> None:

@@ -206,3 +206,100 @@ class BaseETLHandler(ABC):
             m["remote_id"] = "Id"
             new_mapping[connector] = m
         return new_mapping
+
+    def wrap_records_with_metadata(
+        self,
+        df: pd.DataFrame,
+        stream: str,
+        source: str,
+        lookup_field: Optional[str] = None,
+        id_field: Optional[str] = None,
+    ) -> pd.DataFrame:
+        """
+        Wrap each record for the CBX1 ingest endpoint.
+
+        Transforms each flat record into:
+            {
+                "data": {<all fields>},
+                "sourceRecordId": <CRM record id>,
+                "source": <CRM name, e.g. "SALESFORCE">,
+                "lookupKey": <email for contacts/leads, domain for accounts>,
+            }
+
+        This is the shape `cbx1-target` requires; records without a usable
+        ``lookupKey`` (or id) are filtered out so the backend can always match.
+        Connector-agnostic — HubSpot keeps its own private copy for now; new
+        connectors should use this shared implementation.
+
+        Args:
+            df: DataFrame of flat records to wrap
+            stream: Stream name (used to infer the default lookup field)
+            source: CRM source identifier injected as ``source``
+            lookup_field: Override for the lookup column; defaults to ``email``
+                for contact/lead streams and ``domain`` otherwise
+
+        Returns:
+            DataFrame with columns [data, sourceRecordId, source, lookupKey]
+        """
+        wrapped_cols = ["data", "sourceRecordId", "source", "lookupKey"]
+        if df is None or df.empty:
+            return df
+
+        stream_lower = stream.lower()
+        if lookup_field is None:
+            lookup_field = (
+                "email"
+                if ("contact" in stream_lower or "lead" in stream_lower)
+                else "domain"
+            )
+
+        if id_field is not None:
+            id_col = id_field if id_field in df.columns else None
+        else:
+            id_col = "id" if "id" in df.columns else ("Id" if "Id" in df.columns else None)
+        if id_col is None:
+            logger.warning("Missing id column in '%s'; skipping chunk", stream)
+            return pd.DataFrame(columns=wrapped_cols)
+        if lookup_field not in df.columns:
+            logger.warning(
+                "Missing lookup field '%s' in '%s'; skipping chunk", lookup_field, stream
+            )
+            return pd.DataFrame(columns=wrapped_cols)
+
+        df = df.copy()
+        initial = len(df)
+        df = df[df[lookup_field].notna() & (df[lookup_field].astype(str).str.strip() != "")]
+        dropped = initial - len(df)
+        if dropped:
+            logger.info(
+                "Filtered %d '%s' record(s) with null/empty %s", dropped, stream, lookup_field
+            )
+        if df.empty:
+            return df
+
+        df = df.replace({pd.NaT: None})
+        records = df.to_dict(orient="records")
+        wrapped = [
+            {
+                "data": self._clean_record_for_serialization(rec),
+                "sourceRecordId": rec.get(id_col),
+                "source": source,
+                "lookupKey": rec.get(lookup_field),
+            }
+            for rec in records
+        ]
+        logger.info("Wrapped %d '%s' records with source='%s'", len(wrapped), stream, source)
+        return pd.DataFrame(wrapped)
+
+    def _clean_record_for_serialization(self, obj):
+        """Recursively convert pandas NaT/NA to None so records JSON-serialize cleanly."""
+        if isinstance(obj, dict):
+            return {k: self._clean_record_for_serialization(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [self._clean_record_for_serialization(item) for item in obj]
+        try:
+            if pd.isna(obj):
+                return None
+        except (ValueError, TypeError):
+            pass
+        return obj
