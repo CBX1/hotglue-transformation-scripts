@@ -235,47 +235,60 @@ class SalesforceHandler(BaseETLHandler):
             logger.warning("No streams or mapping available for read operation")
             return
         
-        mapping = self.build_read_mapping()
-        
-        # Only process relevant streams for data warehouse
-        target_streams = [s for s in data_streams if s in {"accounts", "contacts", "companies"}]
-        
+        mapping = self.build_read_mapping()  # keyed by connector stream (Account, Contact, Lead)
+
+        # Map each Salesforce connector stream -> CBX1 target stream. We derive this from
+        # the mapping keys ("accounts/Account", "contacts/Contact", "contacts/Lead") rather
+        # than stream_name_mapping, because multiple connector streams (Contact, Lead)
+        # collapse onto a single CBX1 target (contacts) and would otherwise clobber each other.
+        connector_to_target = {}
+        for key in self.mapping_for_flow:
+            parts = key.split("/")
+            if len(parts) == 2:
+                target, connector = parts
+                connector_to_target[connector] = target
+
+        # Process every connector stream we both received from the tap and have a mapping for.
+        target_streams = [s for s in data_streams if s in mapping]
+        if not target_streams:
+            logger.warning(
+                "No Salesforce streams matched the mapping (received=%s, mapped=%s)",
+                data_streams, list(mapping.keys()),
+            )
         for stream in target_streams:
-            self._process_read_stream(stream, mapping)
+            self._process_read_stream(stream, mapping, connector_to_target.get(stream, stream))
     
-    def _process_read_stream(self, stream: str, mapping: Dict) -> None:
+    def _process_read_stream(self, stream: str, mapping: Dict, output_stream: str) -> None:
         """
-        Process a single stream for read operation.
-        
+        Process a single Salesforce connector stream for the read (CRM -> CBX1) path.
+
         Args:
-            stream: Name of the stream to process
-            mapping: Field mapping configuration
+            stream: Salesforce connector stream name (e.g. "Account", "Contact", "Lead")
+            mapping: Read mapping keyed by connector stream
+            output_stream: CBX1 target stream the records belong to ("accounts"/"contacts")
         """
-        logger.info(f"Processing read stream: {stream}")
-        
+        logger.info(f"Processing read stream: {stream} -> {output_stream}")
+
         stream_data = self.get_stream_data(stream)
-        
-        if stream not in mapping:
-            logger.info(f"No mapping for stream {stream}, passing through")
-            self._write_read_output(stream_data, stream)
-            return
-        
-        # Apply field mapping and transformations
+
+        # Apply field mapping (Salesforce field -> CBX1 field)
         stream_data = self._apply_read_mapping(stream_data, stream, mapping[stream])
-        
+
         # Enrich with CBX1 IDs from snapshots
         stream_data = self._enrich_with_cbx1_ids(stream_data, stream)
-        
-        # Handle special case for contacts with account IDs
-        if stream == "contacts":
+
+        # Accounts: CBX1 keys accounts by `domain`, but Salesforce only exposes `Website`.
+        # Derive a clean domain (strip scheme/path/www) so the backend can match on it;
+        # without this the wrap would drop every account for lack of a lookupKey.
+        if output_stream == "accounts":
+            stream_data = self._derive_domain_from_website(stream_data)
+
+        # Contacts/Leads: resolve Salesforce AccountId -> CBX1 account id
+        if output_stream == "contacts":
             stream_data = self._update_contact_account_ids(stream_data)
 
         # Transform dot notation to nested structures
         stream_data = transform_dot_notation_to_nested(stream_data)
-
-        # Determine output (CBX1) stream name
-        inverse_mapping = {v: k for k, v in self.stream_name_mapping.items()}
-        output_stream = inverse_mapping.get(stream, stream)
 
         # Wrap for the cbx1-target ingest endpoint: {data, sourceRecordId, source, lookupKey}.
         # Replaces the previous flat crmSystem/crmAssociationId emission, which cbx1-target
@@ -340,6 +353,36 @@ class SalesforceHandler(BaseETLHandler):
         sent_data = sent_data.rename(columns={"InputId": "id", "RemoteId": "remote_id"})
         return df.merge(sent_data[["id", "remote_id"]], how="left", on="remote_id")
     
+    def _derive_domain_from_website(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Derive a clean `domain` from the (mapped) Salesforce Website value.
+
+        Salesforce Accounts have no domain field, only Website (e.g. "http://edgecomm.com",
+        "www.burlington.com"). CBX1 matches accounts by domain, so we normalise Website into
+        a bare host ("edgecomm.com", "burlington.com"). Assumes the read mapping has already
+        copied Website into a `domain` column.
+        """
+        import re
+
+        if df is None or df.empty or "domain" not in df.columns:
+            return df
+
+        def _clean(value):
+            if value is None or (isinstance(value, float) and pd.isna(value)):
+                return None
+            host = str(value).strip()
+            if not host:
+                return None
+            host = re.sub(r"^https?://", "", host, flags=re.IGNORECASE)
+            host = host.split("/")[0].split("?")[0]
+            if host.lower().startswith("www."):
+                host = host[4:]
+            return host.lower() or None
+
+        df = df.copy()
+        df["domain"] = df["domain"].apply(_clean)
+        return df
+
     def _update_contact_account_ids(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         Update contact account IDs with CBX1 account IDs.
