@@ -189,23 +189,6 @@ class BaseETLHandler(ABC):
             target = k.split("/")[0]
             result[target] = v
         return result
-    
-    def build_read_mapping(self) -> Dict:
-        """
-        Build read mapping from the flow mapping.
-        
-        Converts mapping to dict keyed by connector stream with remote_id mapping.
-        
-        Returns:
-            Dictionary with connector stream as key and mapping as value
-        """
-        new_mapping: Dict[str, Dict] = {}
-        for k, v in self.mapping_for_flow.items():
-            target, connector = k.split("/")
-            m = dict(v)
-            m["remote_id"] = "Id"
-            new_mapping[connector] = m
-        return new_mapping
 
     def wrap_records_with_metadata(
         self,
@@ -266,9 +249,9 @@ class BaseETLHandler(ABC):
             )
             return pd.DataFrame(columns=wrapped_cols)
 
-        df = df.copy()
         initial = len(df)
-        df = df[df[lookup_field].notna() & (df[lookup_field].astype(str).str.strip() != "")]
+        # Filter first, then copy only the kept subset (avoids copying the full frame).
+        df = df[df[lookup_field].notna() & (df[lookup_field].astype(str).str.strip() != "")].copy()
         dropped = initial - len(df)
         if dropped:
             logger.info(

@@ -63,55 +63,18 @@ class SalesforceHandler(BaseETLHandler):
         """
         if not self.mapping_for_flow:
             raise ValueError("No write mapping found for Salesforce flow")
-        
-        mapping = self.build_write_mapping()
+
         streams = self.list_available_streams()
-        
         logger.info(f"Salesforce write: evaluating {len(streams)} streams; only 'contacts' will be written")
-        
+
         for stream in streams:
             if stream == "contacts":
                 # Special handling for contacts (split into Contacts/Leads)
-                self._handle_contacts_write(mapping)
+                self._handle_contacts_write()
             else:
                 logger.info(f"Salesforce write: skipping non-contact stream '{stream}' by policy")
-    
-    def _handle_passthrough_stream(self, stream: str) -> None:
-        """
-        Handle streams that don't have mapping (pass through as-is).
-        
-        Args:
-            stream: Name of the stream to pass through
-        """
-        logger.info(f"Passing through unmapped stream: {stream}")
-        df = self.get_stream_data(stream)
-        output_stream = self.stream_name_mapping.get(stream, stream)
-        self.write_to_singer(df, output_stream)
-    
-    def _handle_standard_stream_write(self, stream: str, mapping: Dict) -> None:
-        """
-        Handle standard stream write with mapping transformations.
-        
-        Args:
-            stream: Name of the stream to process
-            mapping: Field mapping configuration for transformation
-        """
-        logger.info(f"Processing standard stream: {stream}")
-        
-        # Read any previously sent data for deduplication
-        sent_data = self.read_snapshot(self.stream_name_mapping[stream])
-        
-        # Get and transform the data
-        stream_data = self.get_stream_data(stream)
-        stream_columns, stream_data = map_stream_data(stream_data, stream, mapping)
-        
-        # Filter out already sent records
-        stream_data = drop_sent_records(stream, stream_data, sent_data)
-        
-        # Write to output
-        self.write_to_singer(stream_data, self.stream_name_mapping[stream])
-    
-    def _handle_contacts_write(self, mapping: Dict) -> None:
+
+    def _handle_contacts_write(self) -> None:
         """
         Handle contacts write with Salesforce-specific Contact/Lead split.
         
@@ -316,35 +279,14 @@ class SalesforceHandler(BaseETLHandler):
             logger.info("Salesforce read: skipped %d IsDeleted record(s)", removed)
         return df.loc[~mask].copy()
     
-    def _enrich_with_cbx1_ids(self, df: pd.DataFrame, stream: str) -> pd.DataFrame:
-        """
-        Enrich data with CBX1 IDs from previous snapshots.
-
-        Args:
-            df: DataFrame to enrich
-            stream: Name of the stream
-
-        Returns:
-            DataFrame with CBX1 IDs added where available
-        """
-        if "remote_id" not in df.columns:
-            return df
-
-        sent_data = self.read_snapshot(stream)
-        if sent_data is None:
-            return df
-
-        sent_data = sent_data.rename(columns={"InputId": "id", "RemoteId": "remote_id"})
-        return df.merge(sent_data[["id", "remote_id"]], how="left", on="remote_id")
-    
     def _derive_domain_from_website(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Derive a clean `domain` from the (mapped) Salesforce Website value.
+        Derive a clean `domain` from the raw Salesforce `Website` field.
 
         Salesforce Accounts have no domain field, only Website (e.g. "http://edgecomm.com",
         "www.burlington.com"). CBX1 matches accounts by domain, so we normalise Website into
-        a bare host ("edgecomm.com", "burlington.com"). Assumes the read mapping has already
-        copied Website into a `domain` column.
+        a bare host ("edgecomm.com", "burlington.com") and add it as `domain`, leaving the
+        raw Website in place for the backend mapping.
         """
         import re
 
@@ -371,11 +313,11 @@ class SalesforceHandler(BaseETLHandler):
 
     def _update_contact_account_ids(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Update contact account IDs with CBX1 account IDs.
-        
+        Update Contact/Lead account IDs with CBX1 account IDs.
+
         Args:
-            df: Contacts DataFrame
-            
+            df: Contact or Lead DataFrame with a Salesforce AccountId field
+
         Returns:
             DataFrame with updated account IDs
         """
