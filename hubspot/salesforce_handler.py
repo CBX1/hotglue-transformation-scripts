@@ -150,11 +150,23 @@ class SalesforceHandler(BaseETLHandler):
         if self.target_config.get("dynamic_contact_mapping"):
             logger.info("Applying dynamic contact mapping (Contact/Lead split)")
             contacts_df, leads_df = split_contacts_by_account(contacts_df, sent_accounts)
-        
+
+        # Build a connector-keyed write mapping so Contact and Lead retain distinct field
+        # maps. build_write_mapping() keys by CBX1 target ("contacts"), which collapses both
+        # Salesforce objects onto one entry and previously left Contact unmapped/unwritten.
+        mapping_by_connector = {}
+        for key, fields in self.mapping_for_flow.items():
+            parts = key.split("/")
+            if len(parts) == 2:
+                mapping_by_connector[parts[1]] = fields
+
         # Process both Contact and Lead streams
         for sfdc_stream in ["Contact", "Lead"]:
+            if sfdc_stream not in mapping_by_connector:
+                logger.info(f"No mapping configured for {sfdc_stream}, skipping")
+                continue
             self._process_contact_stream(
-                sfdc_stream, contacts_df, leads_df, sent_accounts, mapping
+                sfdc_stream, contacts_df, leads_df, sent_accounts, mapping_by_connector
             )
     
     def _process_contact_stream(
@@ -163,7 +175,7 @@ class SalesforceHandler(BaseETLHandler):
         contacts_df: Optional[pd.DataFrame],
         leads_df: Optional[pd.DataFrame],
         sent_accounts: pd.DataFrame,
-        mapping: Dict,
+        mapping_by_connector: Dict,
     ) -> None:
         """
         Process a specific contact stream (Contact or Lead).
@@ -180,42 +192,38 @@ class SalesforceHandler(BaseETLHandler):
         if df is None or df.empty:
             logger.info(f"No data for {stream_type}, skipping")
             return
-        
-        # Find the mapping name for this stream
-        inverse = {v: k for k, v in self.stream_name_mapping.items()}
-        mapping_name = inverse.get(stream_type)
-        if not mapping_name:
+
+        if stream_type not in mapping_by_connector:
             logger.warning(f"No mapping found for {stream_type}, skipping")
             return
-        
-        # Apply field mapping
-        stream_columns, df = map_stream_data(df, mapping_name, mapping)
+
+        # Apply field mapping (CBX1 -> Salesforce field names) using this object's map
+        stream_columns, df = map_stream_data(df, stream_type, mapping_by_connector)
         new_data = df.copy()
-        
-        # Create snapshot for tracking
-        snap = self.write_snapshot(df, mapping_name)
+
+        # Create snapshot for tracking (keyed by Salesforce object: Contact / Lead)
+        snap = self.write_snapshot(df, stream_type)
         if "hash" in snap.columns:
             snap = snap.drop(columns=["hash"])
-        
-        # For Contacts (not Leads), merge in account remote IDs
-        if stream_type == "Contact":
-            snap = snap.merge(sent_accounts, on="AccountId")
+
+        # For Contacts (not Leads), attach the Salesforce account id. Left-join so a Contact
+        # whose account hasn't synced isn't silently dropped.
+        if stream_type == "Contact" and "AccountId" in snap.columns and not sent_accounts.empty:
+            snap = snap.merge(sent_accounts, on="AccountId", how="left")
             snap = snap.rename(
-                columns={
-                    "AccountId": "InputAccountId",
-                    "RemoteAccountId": "AccountId"
-                }
+                columns={"AccountId": "InputAccountId", "RemoteAccountId": "AccountId"}
             )
-        
+
         # Prepare final output
-        df_out = snap[list(set(stream_columns))].copy()
-        
-        # Filter out already sent records
-        sent_contacts = self.read_snapshot(self.stream_name_mapping[mapping_name])
+        available = [c for c in set(stream_columns) if c in snap.columns]
+        df_out = snap[available].copy()
+
+        # Filter out already sent records (snapshot keyed by Salesforce object)
+        sent_contacts = self.read_snapshot(stream_type)
         df_out = drop_sent_records("contacts", df_out, sent_contacts, new_data)
-        
-        # Write to output
-        self.write_to_singer(df_out, self.stream_name_mapping[mapping_name])
+
+        # Write to output (Salesforce object stream name)
+        self.write_to_singer(df_out, stream_type)
         logger.info(f"Processed {len(df_out)} {stream_type} records")
     
     def handle_read(self) -> None:
