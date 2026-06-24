@@ -89,11 +89,11 @@ jobs:
         env:
           HOTGLUE_API_KEY: ${{ secrets.HOTGLUE_API_KEY }}
         run: |
-          # AJ3x0LMYI is a bidirectional, multi-connector flow. The ETL must be deployed to
-          # EACH connector's slot, not just hubspot — otherwise read/write jobs for the other
+          # AJ3x0LMYI is a bidirectional flow. The ETL must be deployed to EACH supported
+          # connector's slot, not just hubspot — otherwise read/write jobs for the other
           # connectors run whatever was last deployed (stale), which is how Salesforce writes
-          # silently ran old code. Deploy to every enabled connector.
-          for TAP in hubspot salesforce marketo; do
+          # silently ran old code.
+          for TAP in hubspot salesforce; do
             echo "::group::Deploy ETL --tap $TAP"
             npx -y @hotglue/cli@1.1.0 etl deploy \
               --sourceFolder ./hubspot \
