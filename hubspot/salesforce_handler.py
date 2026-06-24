@@ -9,6 +9,7 @@ including the Contact/Lead split functionality and field mapping transformations
 """
 
 import logging
+import re
 from typing import Dict, Optional
 
 import pandas as pd
@@ -23,6 +24,11 @@ from utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Salesforce rejects malformed emails (e.g. an '&' in the address) with INVALID_EMAIL_ADDRESS,
+# which fails the entire export. Skip records whose email Salesforce won't accept (email is
+# optional on Contact/Lead). Conservative format check, not full RFC.
+_EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
 
 
 class SalesforceHandler(BaseETLHandler):
@@ -157,6 +163,19 @@ class SalesforceHandler(BaseETLHandler):
             logger.info(f"No data for {stream_type}, skipping")
             return
 
+        # Skip records with a Salesforce-invalid email so one bad source record can't fail the
+        # whole export (Salesforce returns INVALID_EMAIL_ADDRESS). Email is optional on Lead/Contact.
+        email_col = next((c for c in ("Email", "email") if c in df.columns), None)
+        if email_col:
+            before = len(df)
+            df = df[df[email_col].apply(self._email_ok)].copy()
+            skipped = before - len(df)
+            if skipped:
+                logger.warning("Skipped %d %s record(s) with a Salesforce-invalid email", skipped, stream_type)
+            if df.empty:
+                logger.info(f"No valid {stream_type} records after email filter, skipping")
+                return
+
         if stream_type not in mapping_by_connector:
             logger.warning(f"No mapping found for {stream_type}, skipping")
             return
@@ -195,6 +214,16 @@ class SalesforceHandler(BaseETLHandler):
         # Write to output (Salesforce object stream name)
         self.write_to_singer(df_out, stream_type)
         logger.info(f"Processed {len(df_out)} {stream_type} records")
+
+    @staticmethod
+    def _email_ok(value):
+        """True if Salesforce will accept this email — or it's blank (email is optional)."""
+        if value is None:
+            return True
+        s = str(value).strip()
+        if not s:
+            return True
+        return bool(_EMAIL_RE.match(s))
 
     @staticmethod
     def _company_from_email(email):
