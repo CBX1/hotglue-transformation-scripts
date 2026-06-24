@@ -182,6 +182,12 @@ class SalesforceHandler(BaseETLHandler):
         available = [c for c in set(stream_columns) if c in snap.columns]
         df_out = snap[available].copy()
 
+        # Salesforce requires Company on Leads, but the contact carries no company name.
+        # Interim: derive a placeholder Company from the email domain so Lead writes aren't
+        # rejected. Leads only (Contacts don't require Company).
+        if stream_type == "Lead" and "Email" in df_out.columns:
+            df_out["Company"] = df_out["Email"].apply(self._company_from_email)
+
         # Filter out already sent records (snapshot keyed by Salesforce object)
         sent_contacts = self.read_snapshot(stream_type)
         df_out = drop_sent_records("contacts", df_out, sent_contacts, new_data)
@@ -189,7 +195,15 @@ class SalesforceHandler(BaseETLHandler):
         # Write to output (Salesforce object stream name)
         self.write_to_singer(df_out, stream_type)
         logger.info(f"Processed {len(df_out)} {stream_type} records")
-    
+
+    @staticmethod
+    def _company_from_email(email):
+        """Placeholder Company for Leads (Salesforce requires it): the email domain."""
+        if not isinstance(email, str) or "@" not in email:
+            return None
+        domain = email.split("@")[-1].strip().lower()
+        return domain or None
+
     def handle_read(self) -> None:
         """
         Handle the read operation for Salesforce data.
