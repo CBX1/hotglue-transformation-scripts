@@ -110,6 +110,10 @@ class SalesforceHandler(BaseETLHandler):
         # Split contacts based on account association if configured
         if self.target_config.get("dynamic_contact_mapping"):
             logger.info("Applying dynamic contact mapping (Contact/Lead split)")
+            # Egestion omits accountId for contacts with no account; without the column the
+            # split would raise. Treat a missing column as "no account" so they route to Lead.
+            if contacts_df is not None and not contacts_df.empty and "accountId" not in contacts_df.columns:
+                contacts_df["accountId"] = None
             contacts_df, leads_df = split_contacts_by_account(contacts_df, sent_accounts)
 
         # Connector-keyed mapping so Contact and Lead keep distinct field maps
