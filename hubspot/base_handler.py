@@ -189,3 +189,21 @@ class BaseETLHandler(ABC):
             target = k.split("/")[0]
             result[target] = v
         return result
+
+    def build_connector_mapping(self) -> Dict:
+        """
+        Build mapping keyed by the connector object name.
+
+        Converts mapping from "target/connector" format to a dict keyed by connector,
+        e.g. {"accounts/Account": {...}, "contacts/Contact": {...}} ->
+             {"Account": {...}, "Contact": {...}}.
+
+        Returns:
+            Dictionary with the connector object name as key and its field mapping as value
+        """
+        result = {}
+        for key, fields in self.mapping_for_flow.items():
+            parts = key.split("/")
+            if len(parts) == 2:
+                result[parts[1]] = fields
+        return result

@@ -97,11 +97,7 @@ class SalesforceHandler(BaseETLHandler):
         Opt-in: skipped gracefully when the flow has no ``accounts/Account`` mapping.
         """
         # Connector-keyed mapping; the CBX1 ``accounts`` target maps to the SF ``Account`` object.
-        mapping_by_connector = {}
-        for key, fields in self.mapping_for_flow.items():
-            parts = key.split("/")
-            if len(parts) == 2:
-                mapping_by_connector[parts[1]] = fields
+        mapping_by_connector = self.build_connector_mapping()
 
         if "Account" not in mapping_by_connector:
             logger.info("No Account mapping configured for this flow, skipping accounts write")
@@ -206,11 +202,7 @@ class SalesforceHandler(BaseETLHandler):
 
         # Connector-keyed mapping so Contact and Lead keep distinct field maps
         # (build_write_mapping collapses both onto the `contacts` target).
-        mapping_by_connector = {}
-        for key, fields in self.mapping_for_flow.items():
-            parts = key.split("/")
-            if len(parts) == 2:
-                mapping_by_connector[parts[1]] = fields
+        mapping_by_connector = self.build_connector_mapping()
 
         # Process both Contact and Lead streams
         for sfdc_stream in ["Contact", "Lead"]:
@@ -247,16 +239,10 @@ class SalesforceHandler(BaseETLHandler):
 
         # Skip records with a Salesforce-invalid email so one bad source record can't fail the
         # whole export (Salesforce returns INVALID_EMAIL_ADDRESS). Email is optional on Lead/Contact.
-        email_col = next((c for c in ("Email", "email") if c in df.columns), None)
-        if email_col:
-            before = len(df)
-            df = df[df[email_col].apply(self._email_ok)].copy()
-            skipped = before - len(df)
-            if skipped:
-                logger.warning("Skipped %d %s record(s) with a Salesforce-invalid email", skipped, stream_type)
-            if df.empty:
-                logger.info(f"No valid {stream_type} records after email filter, skipping")
-                return
+        df = self._filter_invalid_emails(df, stream_type, "input")
+        if df.empty:
+            logger.info(f"No valid {stream_type} records after email filter, skipping")
+            return
 
         if stream_type not in mapping_by_connector:
             logger.warning(f"No mapping found for {stream_type}, skipping")
@@ -288,16 +274,7 @@ class SalesforceHandler(BaseETLHandler):
         # Salesforce-invalid email (e.g. a record retried after a prior failure, predating this
         # filter). The input-side filter above only covers this run's fresh data, so guard the
         # output too — otherwise such records re-emit every run and fail the export forever.
-        email_col_out = next((c for c in ("Email", "email") if c in df_out.columns), None)
-        if email_col_out:
-            before = len(df_out)
-            df_out = df_out[df_out[email_col_out].apply(self._email_ok)].copy()
-            dropped = before - len(df_out)
-            if dropped:
-                logger.warning(
-                    "Skipped %d %s record(s) from snapshot history with a Salesforce-invalid email",
-                    dropped, stream_type,
-                )
+        df_out = self._filter_invalid_emails(df_out, stream_type, "snapshot history")
 
         # Salesforce requires Company on Leads, but the contact carries no company name.
         # Interim: derive a placeholder Company from the email domain so Lead writes aren't
@@ -312,6 +289,27 @@ class SalesforceHandler(BaseETLHandler):
         # Write to output (Salesforce object stream name)
         self.write_to_singer(df_out, stream_type)
         logger.info(f"Processed {len(df_out)} {stream_type} records")
+
+    def _filter_invalid_emails(
+        self, df: pd.DataFrame, stream_type: str, context: str
+    ) -> pd.DataFrame:
+        """
+        Drop rows whose email Salesforce would reject (INVALID_EMAIL_ADDRESS); blank
+        emails are kept (email is optional on Contact/Lead). ``context`` labels the log
+        line (e.g. "input" for fresh data vs "snapshot history" for the emitted frame).
+        """
+        email_col = next((c for c in ("Email", "email") if c in df.columns), None)
+        if not email_col:
+            return df
+        before = len(df)
+        df = df[df[email_col].apply(self._email_ok)].copy()
+        dropped = before - len(df)
+        if dropped:
+            logger.warning(
+                "Skipped %d %s record(s) with a Salesforce-invalid email (%s)",
+                dropped, stream_type, context,
+            )
+        return df
 
     @staticmethod
     def _email_ok(value):
