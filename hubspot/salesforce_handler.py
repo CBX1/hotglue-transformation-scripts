@@ -12,6 +12,7 @@ import logging
 import re
 from typing import Dict, Optional
 
+import gluestick as gs
 import pandas as pd
 
 from base_handler import BaseETLHandler
@@ -58,27 +59,86 @@ class SalesforceHandler(BaseETLHandler):
     def handle_write(self) -> None:
         """
         Handle the write operation for Salesforce.
-        
-        This method:
-        1. Processes contact stream from the source
-        2. Applies Salesforce-specific transformations
-        3. Handles the Contact/Lead split based on account associations
-        4. Writes transformed data in Salesforce-compatible format
 
-        Note: As per policy, write jobs only push Contacts (no Accounts or other objects).
+        Processes the source streams CBX1 hands the write job:
+        - ``contacts`` -> split into Salesforce Contacts (account-linked) and Leads
+          (accountless), with field mapping and the Contact/Lead transformations.
+        - ``accounts`` -> Salesforce Accounts, when the flow has an ``accounts/Account`` mapping.
+
+        Accounts are written so the target connector can record the
+        ``CBX1-account-id -> SF-Account-Id`` snapshot that the contact split relies on to
+        attach Contacts to their Account (the snapshot is empty until accounts sync).
         """
         if not self.mapping_for_flow:
             raise ValueError("No write mapping found for Salesforce flow")
 
         streams = self.list_available_streams()
-        logger.info(f"Salesforce write: evaluating {len(streams)} streams; only 'contacts' will be written")
+        logger.info(f"Salesforce write: evaluating {len(streams)} streams")
 
         for stream in streams:
             if stream == "contacts":
                 # Special handling for contacts (split into Contacts/Leads)
                 self._handle_contacts_write()
+            elif stream == "accounts":
+                self._handle_accounts_write()
             else:
-                logger.info(f"Salesforce write: skipping non-contact stream '{stream}' by policy")
+                logger.info(f"Salesforce write: skipping unsupported stream '{stream}' by policy")
+
+    def _handle_accounts_write(self) -> None:
+        """
+        Write CBX1 accounts to the Salesforce ``Account`` object.
+
+        Mirrors the HubSpot accounts path: map CBX1 -> Salesforce field names, dedupe against
+        the sent snapshot (re-including records whose content changed since the last sync), and
+        emit the Salesforce ``Account`` stream. The target connector creates/updates the SF
+        Account and records the ``InputId`` (CBX1 account id) -> ``RemoteId`` (SF Account Id)
+        snapshot that ``_handle_contacts_write`` uses to attach Contacts to their Account.
+
+        Opt-in: skipped gracefully when the flow has no ``accounts/Account`` mapping.
+        """
+        # Connector-keyed mapping; the CBX1 ``accounts`` target maps to the SF ``Account`` object.
+        mapping_by_connector = {}
+        for key, fields in self.mapping_for_flow.items():
+            parts = key.split("/")
+            if len(parts) == 2:
+                mapping_by_connector[parts[1]] = fields
+
+        if "Account" not in mapping_by_connector:
+            logger.info("No Account mapping configured for this flow, skipping accounts write")
+            return
+
+        accounts_df = self.get_stream_data("accounts")
+        if accounts_df is None or accounts_df.empty:
+            logger.info("No account records to write")
+            return
+
+        logger.info("Processing accounts for Salesforce")
+
+        # Apply field mapping (CBX1 -> Salesforce names); map_stream_data also adds externalId
+        # from the source `id` and keeps only mapped columns.
+        _, df_out = map_stream_data(accounts_df, "Account", mapping_by_connector)
+
+        # drop_sent_records / snapshots require externalId (egestion maps id -> externalId);
+        # guard defensively against a misconfigured mapping.
+        if "externalId" not in df_out.columns:
+            df_out["externalId"] = df_out["id"] if "id" in df_out.columns else None
+
+        # Dedupe against previously sent accounts, re-including any whose content changed since
+        # the last sync. (externalId-only dedup would make the path write-once and silently
+        # swallow CBX1 field updates — same fix as the HubSpot accounts path.)
+        snapshot_name = f"Account_{self.flow_id}"
+        sent_accounts = gs.read_snapshots(snapshot_name, self.snapshot_dir)
+        changed_accounts = gs.drop_redundant(
+            df_out.copy(),
+            f"{snapshot_name}.content",
+            self.snapshot_dir,
+            pk=["externalId"],
+            use_csv=True,
+        )
+        df_out = drop_sent_records("accounts", df_out, sent_accounts, changed_accounts)
+
+        self.write_to_singer(df_out, "Account")
+        logger.info(f"Processed {len(df_out)} Account records")
 
     def _handle_contacts_write(self) -> None:
         """
@@ -120,6 +180,28 @@ class SalesforceHandler(BaseETLHandler):
             # split would raise. Treat a missing column as "no account" so they route to Lead.
             if contacts_df is not None and not contacts_df.empty and "accountId" not in contacts_df.columns:
                 contacts_df["accountId"] = None
+
+            # Hold back contacts whose account exists in CBX1 but hasn't synced to Salesforce
+            # yet. Otherwise they'd be written as Leads now and then duplicated as Contacts once
+            # the account lands (the account snapshot is populated by an account write). Records
+            # with no accountId at all are genuinely accountless and still become Leads.
+            if contacts_df is not None and not contacts_df.empty:
+                synced_account_ids = (
+                    set(sent_accounts["AccountId"]) if not sent_accounts.empty else set()
+                )
+                has_account = contacts_df["accountId"].notna() & (
+                    contacts_df["accountId"].astype(str).str.strip() != ""
+                )
+                pending = has_account & ~contacts_df["accountId"].isin(synced_account_ids)
+                pending_count = int(pending.sum())
+                if pending_count:
+                    logger.info(
+                        "Holding %d contact(s) whose account has not synced to Salesforce yet; "
+                        "they will sync as Contacts once the account lands",
+                        pending_count,
+                    )
+                    contacts_df = contacts_df[~pending].copy()
+
             contacts_df, leads_df = split_contacts_by_account(contacts_df, sent_accounts)
 
         # Connector-keyed mapping so Contact and Lead keep distinct field maps
@@ -200,6 +282,22 @@ class SalesforceHandler(BaseETLHandler):
         # Prepare final output
         available = [c for c in set(stream_columns) if c in snap.columns]
         df_out = snap[available].copy()
+
+        # Re-apply the email guard to the records actually being emitted. `df_out` is rebuilt
+        # from the accumulated snapshot, which can still hold historical records with a
+        # Salesforce-invalid email (e.g. a record retried after a prior failure, predating this
+        # filter). The input-side filter above only covers this run's fresh data, so guard the
+        # output too — otherwise such records re-emit every run and fail the export forever.
+        email_col_out = next((c for c in ("Email", "email") if c in df_out.columns), None)
+        if email_col_out:
+            before = len(df_out)
+            df_out = df_out[df_out[email_col_out].apply(self._email_ok)].copy()
+            dropped = before - len(df_out)
+            if dropped:
+                logger.warning(
+                    "Skipped %d %s record(s) from snapshot history with a Salesforce-invalid email",
+                    dropped, stream_type,
+                )
 
         # Salesforce requires Company on Leads, but the contact carries no company name.
         # Interim: derive a placeholder Company from the email domain so Lead writes aren't

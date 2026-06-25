@@ -75,7 +75,7 @@ Additional expectations:
 
 ## Write Policy
 
-- Salesforce: Only `Contact`/`Lead` are written (split determined by account linkage). `Account` (and other objects) are not written.
+- Salesforce: `contacts` are always written, split into `Contact` (account-linked) and `Lead` (accountless) by account linkage. `accounts` are written to the Salesforce `Account` object **when the flow has an `accounts/Account` mapping**. Contacts whose account has not yet synced to Salesforce are held back (not written as Leads) so they sync as `Contact`s once the account lands and the `Account` snapshot maps `CBX1-account-id → SF-Account-Id`. Other objects are not written.
 - HubSpot: `contacts` are always written. `accounts` (HubSpot companies object) are written **only when the tenant has a `TenantEgestionMapping` configured for `ACCOUNT → HUBSPOT`** — the presence of an `"accounts"` key in `stream_name_mapping` is the opt-in signal. Other objects are not written.
 
 ## Commit & Pull Request Guidelines
