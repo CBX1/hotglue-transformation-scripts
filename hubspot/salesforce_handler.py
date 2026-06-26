@@ -26,11 +26,6 @@ from utils import (
 
 logger = logging.getLogger(__name__)
 
-# Salesforce rejects malformed emails (e.g. an '&' in the address) with INVALID_EMAIL_ADDRESS,
-# which fails the entire export. Skip records whose email Salesforce won't accept (email is
-# optional on Contact/Lead). Conservative format check, not full RFC.
-_EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
-
 
 class SalesforceHandler(BaseETLHandler):
     """
@@ -237,13 +232,6 @@ class SalesforceHandler(BaseETLHandler):
             logger.info(f"No data for {stream_type}, skipping")
             return
 
-        # Skip records with a Salesforce-invalid email so one bad source record can't fail the
-        # whole export (Salesforce returns INVALID_EMAIL_ADDRESS). Email is optional on Lead/Contact.
-        df = self._filter_invalid_emails(df, stream_type, "input")
-        if df.empty:
-            logger.info(f"No valid {stream_type} records after email filter, skipping")
-            return
-
         if stream_type not in mapping_by_connector:
             logger.warning(f"No mapping found for {stream_type}, skipping")
             return
@@ -282,37 +270,6 @@ class SalesforceHandler(BaseETLHandler):
         # Write to output (Salesforce object stream name)
         self.write_to_singer(df_out, stream_type)
         logger.info(f"Processed {len(df_out)} {stream_type} records")
-
-    def _filter_invalid_emails(
-        self, df: pd.DataFrame, stream_type: str, context: str
-    ) -> pd.DataFrame:
-        """
-        Drop rows whose email Salesforce would reject (INVALID_EMAIL_ADDRESS); blank
-        emails are kept (email is optional on Contact/Lead). ``context`` labels the log
-        line (e.g. "input" for fresh data).
-        """
-        email_col = next((c for c in ("Email", "email") if c in df.columns), None)
-        if not email_col:
-            return df
-        before = len(df)
-        df = df[df[email_col].apply(self._email_ok)].copy()
-        dropped = before - len(df)
-        if dropped:
-            logger.warning(
-                "Skipped %d %s record(s) with a Salesforce-invalid email (%s)",
-                dropped, stream_type, context,
-            )
-        return df
-
-    @staticmethod
-    def _email_ok(value):
-        """True if Salesforce will accept this email — or it's blank (email is optional)."""
-        if value is None:
-            return True
-        s = str(value).strip()
-        if not s:
-            return True
-        return bool(_EMAIL_RE.match(s))
 
     @staticmethod
     def _company_from_email(email):
