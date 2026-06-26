@@ -372,8 +372,17 @@ class SalesforceHandler(BaseETLHandler):
         """
         import re
 
-        if df is None or df.empty or "Website" not in df.columns:
+        if df is None or df.empty:
             return df
+        if "Website" not in df.columns:
+            # `domain` is the account lookupKey and is derived solely from Website. If the
+            # tap catalog omits Website we can derive no domain, and every Account would be
+            # silently dropped downstream. Fail loudly — this is a catalog misconfiguration.
+            raise ValueError(
+                "Salesforce Account read: 'Website' is absent from the tap catalog, so no "
+                "'domain' lookupKey can be derived and every Account would be dropped. Add "
+                "'Website' to the Salesforce tap catalog."
+            )
 
         def _clean(value):
             if value is None or (isinstance(value, float) and pd.isna(value)):
@@ -451,13 +460,14 @@ class SalesforceHandler(BaseETLHandler):
     ) -> pd.DataFrame:
         """
         Wrap each flat record into the cbx1-target envelope
-        {data, sourceRecordId, source, lookupKey}. Records missing an id or a
-        usable lookupKey are dropped so the backend can always match.
+        {data, sourceRecordId, source, lookupKey}. Individual records whose
+        lookupKey value is null/empty are dropped so the backend can always
+        match; a missing id or lookup *column* (the tap catalog omitted the
+        field entirely) raises, rather than silently emptying the stream.
 
         lookup_field defaults to ``email`` for contact/lead streams and
         ``domain`` otherwise; id_field defaults to ``id``/``Id``.
         """
-        wrapped_cols = ["data", "sourceRecordId", "source", "lookupKey"]
         if df is None or df.empty:
             return df
 
@@ -473,14 +483,20 @@ class SalesforceHandler(BaseETLHandler):
             id_col = id_field if id_field in df.columns else None
         else:
             id_col = "id" if "id" in df.columns else ("Id" if "Id" in df.columns else None)
+        # A missing id or lookup column means the tap catalog omitted a field every record
+        # needs to be matched in CBX1. Returning empty here would silently drop the whole
+        # stream while still reporting success, so fail loudly — by this point the frame is
+        # non-empty (genuinely empty frames returned above), so this is a misconfiguration.
         if id_col is None:
-            logger.warning("Missing id column in '%s'; skipping chunk", stream)
-            return pd.DataFrame(columns=wrapped_cols)
-        if lookup_field not in df.columns:
-            logger.warning(
-                "Missing lookup field '%s' in '%s'; skipping chunk", lookup_field, stream
+            raise ValueError(
+                f"Cannot wrap '{stream}' records: id field "
+                f"'{id_field or 'id/Id'}' is absent from the tap catalog."
             )
-            return pd.DataFrame(columns=wrapped_cols)
+        if lookup_field not in df.columns:
+            raise ValueError(
+                f"Cannot wrap '{stream}' records: lookup field '{lookup_field}' is absent "
+                f"from the tap catalog. It is required to match records in CBX1."
+            )
 
         initial = len(df)
         # Filter first, then copy only the kept subset (avoids copying the full frame).
