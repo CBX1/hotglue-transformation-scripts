@@ -189,20 +189,21 @@ class BaseETLHandler(ABC):
             target = k.split("/")[0]
             result[target] = v
         return result
-    
-    def build_read_mapping(self) -> Dict:
+
+    def build_connector_mapping(self) -> Dict:
         """
-        Build read mapping from the flow mapping.
-        
-        Converts mapping to dict keyed by connector stream with remote_id mapping.
-        
+        Build mapping keyed by the connector object name.
+
+        Converts mapping from "target/connector" format to a dict keyed by connector,
+        e.g. {"accounts/Account": {...}, "contacts/Contact": {...}} ->
+             {"Account": {...}, "Contact": {...}}.
+
         Returns:
-            Dictionary with connector stream as key and mapping as value
+            Dictionary with the connector object name as key and its field mapping as value
         """
-        new_mapping: Dict[str, Dict] = {}
-        for k, v in self.mapping_for_flow.items():
-            target, connector = k.split("/")
-            m = dict(v)
-            m["remote_id"] = "Id"
-            new_mapping[connector] = m
-        return new_mapping
+        result = {}
+        for key, fields in self.mapping_for_flow.items():
+            parts = key.split("/")
+            if len(parts) == 2:
+                result[parts[1]] = fields
+        return result
