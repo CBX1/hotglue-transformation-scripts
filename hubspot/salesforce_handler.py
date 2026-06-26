@@ -269,13 +269,6 @@ class SalesforceHandler(BaseETLHandler):
         available = [c for c in set(stream_columns) if c in snap.columns]
         df_out = snap[available].copy()
 
-        # Re-apply the email guard to the records actually being emitted. `df_out` is rebuilt
-        # from the accumulated snapshot, which can still hold historical records with a
-        # Salesforce-invalid email (e.g. a record retried after a prior failure, predating this
-        # filter). The input-side filter above only covers this run's fresh data, so guard the
-        # output too — otherwise such records re-emit every run and fail the export forever.
-        df_out = self._filter_invalid_emails(df_out, stream_type, "snapshot history")
-
         # Salesforce requires Company on Leads, but the contact carries no company name.
         # Interim: derive a placeholder Company from the email domain so Lead writes aren't
         # rejected. Leads only (Contacts don't require Company).
@@ -296,7 +289,7 @@ class SalesforceHandler(BaseETLHandler):
         """
         Drop rows whose email Salesforce would reject (INVALID_EMAIL_ADDRESS); blank
         emails are kept (email is optional on Contact/Lead). ``context`` labels the log
-        line (e.g. "input" for fresh data vs "snapshot history" for the emitted frame).
+        line (e.g. "input" for fresh data).
         """
         email_col = next((c for c in ("Email", "email") if c in df.columns), None)
         if not email_col:
