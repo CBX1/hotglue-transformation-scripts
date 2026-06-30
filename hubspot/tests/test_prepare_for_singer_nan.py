@@ -1,13 +1,17 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-"""Tests for the NaN/Infinity-spelling string scrub in ``prepare_for_singer``.
+"""Tests for the NaN/Infinity-token scrub in ``prepare_for_singer``.
 
 Regression for the CBX1 -> HubSpot export failure where a contact whose
 ``jobtitle`` was the literal string ``"NaN"`` caused the hotglue target-hubspot
 to re-serialize the value as the non-standard JSON token ``NaN``, which the
 HubSpot (Jackson) API rejects with
 ``Non-standard token 'NaN': enable JsonReadFeature.ALLOW_NON_NUMERIC_NUMBERS``.
+
+Matching is CASE-SENSITIVE and exact: production proved the downstream
+distinguishes ``"NaN"`` (broke the export) from ``"Nan"`` (a given name that
+synced fine), so only the exact ECMAScript tokens are nulled.
 
 Run standalone:  python hubspot/tests/test_prepare_for_singer_nan.py
 Run via pytest:  pytest hubspot/tests/test_prepare_for_singer_nan.py
@@ -29,23 +33,35 @@ from utils import (  # noqa: E402
 )
 
 
-def test_detects_nonfinite_spellings():
-    for s in ["NaN", "nan", "NAN", "-NaN", "Infinity", "-Infinity",
-              "inf", "-inf", "Inf", "INF", "+inf", "  NaN  "]:
+def test_detects_nonfinite_tokens():
+    # Only the exact ECMAScript non-numeric number literals are dangerous.
+    for s in ["NaN", "Infinity", "-Infinity"]:
         assert _spells_nonfinite_float(s), s
 
 
 def test_preserves_safe_values():
-    # NA-like sentinels pandas keeps as strings (valid JSON downstream) and
-    # ordinary values that merely contain the substring must be preserved.
-    for s in ["N/A", "None", "NA", "n/a", "null", "NULL", "<NA>", "#N/A",
-              "1.#IND", "", "CEO", "Infinity Ward", "nanjing", "Siyu"]:
+    # Case/spelling variants that the downstream does NOT re-emit as bare
+    # tokens, NA-like sentinels, names, and substrings — all must be preserved.
+    for s in ["Nan", "nan", "NAN", "-NaN", "inf", "-inf", "Inf", "INF", "+inf",
+              "  NaN  ", "infinity", "N/A", "None", "NA", "n/a", "null", "NULL",
+              "<NA>", "#N/A", "1.#IND", "", "CEO", "Infinity Ward", "nanjing",
+              "Siyu"]:
         assert not _spells_nonfinite_float(s), s
     for v in [None, 42, 3.14, True]:
         assert not _spells_nonfinite_float(v), v
 
 
-def test_nulls_top_level_nan_string():
+def test_case_sensitive_preserves_nan_name():
+    # Regression: a case-insensitive match silently nulled the given name "Nan"
+    # (4 real contacts in the thoughtspot data) even though it syncs fine.
+    df = pd.DataFrame([{"firstname": "Nan", "lastname": "Patel", "jobtitle": "nan"}])
+    out = prepare_for_singer(df).to_dict(orient="records")[0]
+    assert out["firstname"] == "Nan"
+    assert out["lastname"] == "Patel"
+    assert out["jobtitle"] == "nan"   # lowercase, not the exact token -> kept
+
+
+def test_nulls_top_level_nan_token():
     # The exact production record that broke the export.
     row = {
         "email": "siyu.liu2024@gmail.com",
@@ -61,12 +77,12 @@ def test_nulls_top_level_nan_string():
 
 def test_scrubs_nested_and_leaves_numeric_and_datetime():
     df = pd.DataFrame([{
-        "jobtitle": "Infinity",
+        "jobtitle": "Infinity",                    # exact token -> None
         "good": "CEO",
-        "na_string": "N/A",                  # must be preserved
-        "nested": {"a": "inf", "b": "ok"},   # nested spelling -> None
-        "arr": ["NaN", "keep"],              # spelling inside a list -> None
-        "score": np.float64("nan"),          # numeric NaN: left for the writer
+        "na_string": "N/A",                        # must be preserved
+        "nested": {"a": "-Infinity", "b": "ok"},   # nested token -> None
+        "arr": ["NaN", "keep", "inf"],             # only exact "NaN" -> None
+        "score": np.float64("nan"),                # numeric NaN: left for writer
         "when": pd.Timestamp("2026-06-30T01:11:40.684Z"),
     }])
     out = prepare_for_singer(df).to_dict(orient="records")[0]
@@ -74,7 +90,7 @@ def test_scrubs_nested_and_leaves_numeric_and_datetime():
     assert out["good"] == "CEO"
     assert out["na_string"] == "N/A"
     assert out["nested"] == {"a": None, "b": "ok"}
-    assert out["arr"] == [None, "keep"]
+    assert out["arr"] == [None, "keep", "inf"]     # "inf" kept (not exact token)
     assert out["when"] == "2026-06-30T01:11:40.684000Z"
 
 
