@@ -15,10 +15,12 @@ These utilities are designed to work with the HotGlue framework and support
 both Salesforce and HubSpot connector operations.
 """
 
+import ast
 import glob
 import json as _json
 import logging
 import os
+import re
 from typing import Dict, Iterator, List, Optional, Tuple
 
 import pandas as pd
@@ -164,20 +166,75 @@ def _spells_nonfinite_float(value: object) -> bool:
     return s in _NONFINITE_FLOAT_SPELLINGS
 
 
-def _scrub_nonfinite_float_strings(value: object, counter: List[int]) -> object:
-    """Recursively replace NaN/Infinity-spelling strings with ``None``.
+# A number written with grouping/thousands separators, e.g. "1,316",
+# "1,234,567", "12,345.67". ast.literal_eval reads such a bare comma-separated
+# string as a Python tuple, which the downstream parser then turns into a JSON
+# array (see _parses_to_python_container). Stripping the separators restores the
+# intended scalar.
+_GROUPED_NUMBER_RE = re.compile(r"[+-]?\d{1,3}(?:,\d{3})+(?:\.\d+)?")
 
-    Walks nested dicts/lists so a bad value inside an ``object``/``array``
-    column is caught too. ``counter`` is a single-element list used as a
-    mutable counter so the caller can report how many values were scrubbed.
+# A container literal must contain one of these; used as a cheap pre-filter so
+# we only attempt ast.literal_eval on the few values that could parse to one.
+_CONTAINER_HINT_CHARS = (",", "[", "{", "(")
+
+
+def _parses_to_python_container(value: object) -> bool:
+    """Return True if ``ast.literal_eval`` would parse ``value`` into a
+    container (tuple/list/dict/set).
+
+    The hotglue/gluestick read path (``gluestick.parse_objs``) "unstringifies"
+    field values with ``ast.literal_eval``. A value like ``"1,316"`` is a valid
+    Python tuple literal ``(1, 316)``, so it gets re-serialized as the JSON
+    array ``[1, 316]`` and is rejected by scalar (String) target properties —
+    e.g. the HubSpot API raises ``Cannot deserialize value of type
+    java.lang.String from Array value`` for the ``zip`` field. (A scalar result
+    such as the int from ``"94538"`` is harmless: strict parsers coerce a JSON
+    number into a String; only arrays/objects break.)
     """
-    if _spells_nonfinite_float(value):
-        counter[0] += 1
-        return None
+    if not isinstance(value, str):
+        return False
+    if not any(c in value for c in _CONTAINER_HINT_CHARS):
+        return False
+    try:
+        return isinstance(ast.literal_eval(value), (tuple, list, dict, set))
+    except Exception:
+        return False
+
+
+def _sanitize_singer_value(value: object, counts: Dict[str, int]) -> object:
+    """Recursively sanitize string leaves so the Singer output survives strict,
+    ``ast.literal_eval``-based downstream parsers (e.g. hotglue target-hubspot).
+
+    Two classes of malformed scalar string are neutralized:
+
+    1. NaN/Infinity spellings ("NaN", "inf", ...) -> ``None`` — otherwise they
+       are re-emitted as the non-standard JSON tokens ``NaN``/``Infinity`` and
+       rejected by Jackson. (See ``_spells_nonfinite_float``.)
+    2. Strings ``ast.literal_eval`` would turn into a container ("1,316" ->
+       ``(1, 316)``). A grouped number has its separators removed so it
+       round-trips as the intended scalar ("1,316" -> "1316"); any other
+       container literal in a scalar field is dropped (``None``).
+
+    Only values that WOULD break downstream are altered — every other string
+    passes through untouched. Walks nested dicts/lists. ``counts`` accumulates
+    per-reason tallies for logging.
+    """
+    if isinstance(value, str):
+        if _spells_nonfinite_float(value):
+            counts["nonfinite"] = counts.get("nonfinite", 0) + 1
+            return None
+        if _parses_to_python_container(value):
+            s = value.strip()
+            if _GROUPED_NUMBER_RE.fullmatch(s):
+                counts["regrouped_number"] = counts.get("regrouped_number", 0) + 1
+                return s.replace(",", "")
+            counts["dropped_container"] = counts.get("dropped_container", 0) + 1
+            return None
+        return value
     if isinstance(value, dict):
-        return {k: _scrub_nonfinite_float_strings(v, counter) for k, v in value.items()}
+        return {k: _sanitize_singer_value(v, counts) for k, v in value.items()}
     if isinstance(value, list):
-        return [_scrub_nonfinite_float_strings(v, counter) for v in value]
+        return [_sanitize_singer_value(v, counts) for v in value]
     return value
 
 
@@ -189,12 +246,13 @@ def prepare_for_singer(df: Optional[pd.DataFrame]) -> pd.DataFrame:
     particularly for datetime fields. This function ensures all datetime columns
     are properly serialized to ISO 8601 format strings.
 
-    It also nulls out string values that *spell* a non-finite float
-    ("NaN"/"Infinity"/...). Such values are valid JSON strings here, but a
-    downstream pandas-based consumer (e.g. target-hubspot) coerces them back to
-    float NaN/Inf and re-emits them as the non-standard JSON tokens
-    ``NaN``/``Infinity``, which strict parsers (Jackson) reject — failing the
-    whole export.
+    It also sanitizes string values that strict, ``ast.literal_eval``-based
+    downstream parsers (e.g. target-hubspot) would mangle: NaN/Infinity
+    spellings (re-emitted as the non-standard JSON tokens ``NaN``/``Infinity``)
+    and strings that parse as a Python container — notably grouped numbers like
+    ``"1,316"``, which become the tuple ``(1, 316)`` -> JSON array ``[1, 316]``
+    and are rejected by scalar (String) properties. See
+    ``_sanitize_singer_value``.
 
     Args:
         df: DataFrame to prepare for Singer output
@@ -224,26 +282,28 @@ def prepare_for_singer(df: Optional[pd.DataFrame]) -> pd.DataFrame:
         prepared_df = prepared_df.astype({col: "object"})
         prepared_df.loc[:, col] = formatted
 
-    # Null out NaN/Infinity-spelling string values (see module note above).
-    # Only string/object columns can hold these spellings; numeric NaN is
-    # already serialized as JSON null by the Singer writer.
-    scrub_counts: Dict[str, int] = {}
+    # Sanitize string values that strict, ast.literal_eval-based downstream
+    # parsers (e.g. hotglue target-hubspot) would mangle: NaN/Infinity spellings
+    # and strings that parse as Python containers. Only string/object columns can
+    # hold these; numeric NaN is already serialized as JSON null by the writer.
+    # See _sanitize_singer_value for the rules.
+    counts: Dict[str, int] = {}
+    touched_cols: List[str] = []
     string_cols = prepared_df.select_dtypes(include=["object", "string"]).columns
     for col in string_cols:
-        counter = [0]
-        scrubbed = prepared_df[col].map(
-            lambda v: _scrub_nonfinite_float_strings(v, counter)
-        )
-        if counter[0]:
+        before = sum(counts.values())
+        scrubbed = prepared_df[col].map(lambda v: _sanitize_singer_value(v, counts))
+        if sum(counts.values()) > before:
             prepared_df[col] = scrubbed
-            scrub_counts[col] = counter[0]
+            touched_cols.append(col)
 
-    if scrub_counts:
+    if counts:
         logger.warning(
-            "prepare_for_singer: replaced %d NaN/Infinity-spelling string value(s) "
-            "with null to keep downstream JSON standards-compliant (by column: %s)",
-            sum(scrub_counts.values()),
-            scrub_counts,
+            "prepare_for_singer: sanitized %d malformed string value(s) for "
+            "downstream JSON safety (by reason: %s; columns: %s)",
+            sum(counts.values()),
+            counts,
+            touched_cols,
         )
 
     return prepared_df
