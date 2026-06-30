@@ -139,31 +139,29 @@ def map_stream_data(
     return unique_columns, stream_data
 
 
-# Strings that a downstream pandas-based consumer coerces into a *non-finite*
-# float. When such a consumer (e.g. the hotglue target-hubspot) re-reads our
-# Singer output with ``pandas.read_json``, a quoted value like ``"NaN"`` is
-# coerced to ``float('nan')`` and then re-serialized as the bare token ``NaN``
-# (``json.dumps`` permits it by default). Strict JSON parsers — notably Jackson
-# on the HubSpot API — reject the ``NaN`` / ``Infinity`` tokens, which fails the
-# entire export. NA-like sentinels that pandas keeps as strings (``"N/A"``,
-# ``"None"``, ``"null"`` …) are deliberately NOT matched: they stay valid JSON.
-_NONFINITE_FLOAT_SPELLINGS = frozenset({"nan", "inf", "infinity"})
+# The exact ECMAScript non-numeric number literals. A downstream consumer
+# (e.g. the hotglue target-hubspot) re-emits a quoted value EQUAL to one of
+# these as the corresponding *bare* JSON token (``NaN``/``Infinity``), which
+# strict parsers — notably Jackson on the HubSpot API — reject
+# ("Non-standard token 'NaN'"), failing the entire export.
+#
+# Matching is CASE-SENSITIVE and exact, on purpose: production proved the
+# downstream distinguishes ``"NaN"`` (a jobtitle that broke the export) from
+# ``"Nan"`` (a common given name that synced fine). A case-insensitive match
+# (the original implementation) silently nulled valid ``"Nan"`` first names.
+# Other NA-like strings ("N/A", "None", "null", "nan") stay valid JSON and are
+# left untouched.
+_NONFINITE_FLOAT_TOKENS = frozenset({"NaN", "Infinity", "-Infinity"})
 
 
 def _spells_nonfinite_float(value: object) -> bool:
-    """Return True if ``value`` is a string that spells a non-finite float.
+    """Return True if ``value`` is exactly one of the non-standard JSON number
+    tokens ``"NaN"``, ``"Infinity"``, ``"-Infinity"``.
 
-    Matches case-insensitively, with an optional leading sign:
-    ``"NaN"``, ``"nan"``, ``"-NaN"``, ``"Infinity"``, ``"-Infinity"``,
-    ``"inf"``, ``"INF"``. See ``_NONFINITE_FLOAT_SPELLINGS`` for why these
-    specific spellings are dangerous downstream.
+    Case-sensitive and exact — see ``_NONFINITE_FLOAT_TOKENS`` for why (a
+    case-insensitive match nulls valid names like ``"Nan"``).
     """
-    if not isinstance(value, str):
-        return False
-    s = value.strip().lower()
-    if s[:1] in ("+", "-"):
-        s = s[1:]
-    return s in _NONFINITE_FLOAT_SPELLINGS
+    return isinstance(value, str) and value in _NONFINITE_FLOAT_TOKENS
 
 
 # A number written with grouping/thousands separators, e.g. "1,316",
@@ -205,17 +203,22 @@ def _sanitize_singer_value(value: object, counts: Dict[str, int]) -> object:
     """Recursively sanitize string leaves so the Singer output survives strict,
     ``ast.literal_eval``-based downstream parsers (e.g. hotglue target-hubspot).
 
-    Two classes of malformed scalar string are neutralized:
+    Two classes of malformed scalar string are handled:
 
-    1. NaN/Infinity spellings ("NaN", "inf", ...) -> ``None`` — otherwise they
-       are re-emitted as the non-standard JSON tokens ``NaN``/``Infinity`` and
-       rejected by Jackson. (See ``_spells_nonfinite_float``.)
+    1. NaN/Infinity tokens ("NaN", "Infinity", "-Infinity") -> ``None`` —
+       otherwise re-emitted as the non-standard JSON tokens ``NaN``/``Infinity``
+       and rejected by Jackson. (See ``_spells_nonfinite_float``.)
     2. Strings ``ast.literal_eval`` would turn into a container ("1,316" ->
        ``(1, 316)``). A grouped number has its separators removed so it
-       round-trips as the intended scalar ("1,316" -> "1316"); any other
-       container literal in a scalar field is dropped (``None``).
+       round-trips as the intended scalar ("1,316" -> "1316"). Any *other*
+       container literal (e.g. "12,34", "[1, 2]") has no safe, connector-
+       agnostic rewrite — stripping commas would corrupt a European decimal,
+       and ``repr()``-wrapping would inject literal quotes for non-literal_eval
+       consumers like the CBX1 read path — so it is left UNCHANGED and only
+       flagged. A loud, isolated downstream failure is preferable to silently
+       dropping or corrupting data.
 
-    Only values that WOULD break downstream are altered — every other string
+    Only values that are safely repairable are altered — every other string
     passes through untouched. Walks nested dicts/lists. ``counts`` accumulates
     per-reason tallies for logging.
     """
@@ -228,8 +231,8 @@ def _sanitize_singer_value(value: object, counts: Dict[str, int]) -> object:
             if _GROUPED_NUMBER_RE.fullmatch(s):
                 counts["regrouped_number"] = counts.get("regrouped_number", 0) + 1
                 return s.replace(",", "")
-            counts["dropped_container"] = counts.get("dropped_container", 0) + 1
-            return None
+            counts["flagged_container"] = counts.get("flagged_container", 0) + 1
+            return value
         return value
     if isinstance(value, dict):
         return {k: _sanitize_singer_value(v, counts) for k, v in value.items()}
@@ -289,21 +292,24 @@ def prepare_for_singer(df: Optional[pd.DataFrame]) -> pd.DataFrame:
     # See _sanitize_singer_value for the rules.
     counts: Dict[str, int] = {}
     touched_cols: List[str] = []
+    _CHANGED = ("nonfinite", "regrouped_number")  # reasons that mutate the value
     string_cols = prepared_df.select_dtypes(include=["object", "string"]).columns
     for col in string_cols:
-        before = sum(counts.values())
+        before = sum(counts.get(k, 0) for k in _CHANGED)
         scrubbed = prepared_df[col].map(lambda v: _sanitize_singer_value(v, counts))
-        if sum(counts.values()) > before:
+        if sum(counts.get(k, 0) for k in _CHANGED) > before:
             prepared_df[col] = scrubbed
             touched_cols.append(col)
 
     if counts:
         logger.warning(
-            "prepare_for_singer: sanitized %d malformed string value(s) for "
-            "downstream JSON safety (by reason: %s; columns: %s)",
-            sum(counts.values()),
-            counts,
+            "prepare_for_singer: sanitized %d malformed string value(s) for downstream "
+            "JSON safety (changed columns: %s; reasons: %s). %d container-literal(s) "
+            "left as-is and may fail strict scalar targets.",
+            sum(counts.get(k, 0) for k in _CHANGED),
             touched_cols,
+            counts,
+            counts.get("flagged_container", 0),
         )
 
     return prepared_df

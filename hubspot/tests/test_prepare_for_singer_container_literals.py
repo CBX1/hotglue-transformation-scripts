@@ -71,12 +71,15 @@ def test_grouped_number_variants():
     assert out["c"] == "1316"
 
 
-def test_drops_non_numeric_container_literal():
-    # A container literal that is NOT a grouped number is dropped (can't be a
-    # valid scalar property value) rather than emitted as an array/object.
-    df = pd.DataFrame([{"weird": "[1, 2, 3]", "ok": "Engineer"}])
+def test_preserves_non_numeric_container_literal():
+    # A container literal that is NOT a grouped number has no safe, connector-
+    # agnostic rewrite, so it is left UNCHANGED (and flagged) rather than
+    # silently dropped or corrupted. A European decimal "12,34" is the key case:
+    # stripping its comma would wrongly yield "1234".
+    df = pd.DataFrame([{"euro": "12,34", "weird": "[1, 2, 3]", "ok": "Engineer"}])
     out = prepare_for_singer(df).to_dict(orient="records")[0]
-    assert out["weird"] is None
+    assert out["euro"] == "12,34"
+    assert out["weird"] == "[1, 2, 3]"
     assert out["ok"] == "Engineer"
 
 
