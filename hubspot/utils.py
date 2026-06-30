@@ -137,23 +137,74 @@ def map_stream_data(
     return unique_columns, stream_data
 
 
+# Strings that a downstream pandas-based consumer coerces into a *non-finite*
+# float. When such a consumer (e.g. the hotglue target-hubspot) re-reads our
+# Singer output with ``pandas.read_json``, a quoted value like ``"NaN"`` is
+# coerced to ``float('nan')`` and then re-serialized as the bare token ``NaN``
+# (``json.dumps`` permits it by default). Strict JSON parsers — notably Jackson
+# on the HubSpot API — reject the ``NaN`` / ``Infinity`` tokens, which fails the
+# entire export. NA-like sentinels that pandas keeps as strings (``"N/A"``,
+# ``"None"``, ``"null"`` …) are deliberately NOT matched: they stay valid JSON.
+_NONFINITE_FLOAT_SPELLINGS = frozenset({"nan", "inf", "infinity"})
+
+
+def _spells_nonfinite_float(value: object) -> bool:
+    """Return True if ``value`` is a string that spells a non-finite float.
+
+    Matches case-insensitively, with an optional leading sign:
+    ``"NaN"``, ``"nan"``, ``"-NaN"``, ``"Infinity"``, ``"-Infinity"``,
+    ``"inf"``, ``"INF"``. See ``_NONFINITE_FLOAT_SPELLINGS`` for why these
+    specific spellings are dangerous downstream.
+    """
+    if not isinstance(value, str):
+        return False
+    s = value.strip().lower()
+    if s[:1] in ("+", "-"):
+        s = s[1:]
+    return s in _NONFINITE_FLOAT_SPELLINGS
+
+
+def _scrub_nonfinite_float_strings(value: object, counter: List[int]) -> object:
+    """Recursively replace NaN/Infinity-spelling strings with ``None``.
+
+    Walks nested dicts/lists so a bad value inside an ``object``/``array``
+    column is caught too. ``counter`` is a single-element list used as a
+    mutable counter so the caller can report how many values were scrubbed.
+    """
+    if _spells_nonfinite_float(value):
+        counter[0] += 1
+        return None
+    if isinstance(value, dict):
+        return {k: _scrub_nonfinite_float_strings(v, counter) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_scrub_nonfinite_float_strings(v, counter) for v in value]
+    return value
+
+
 def prepare_for_singer(df: Optional[pd.DataFrame]) -> pd.DataFrame:
     """
     Prepare DataFrame for Singer format output.
-    
+
     Singer is a specification for data exchange that requires specific formatting,
     particularly for datetime fields. This function ensures all datetime columns
     are properly serialized to ISO 8601 format strings.
-    
+
+    It also nulls out string values that *spell* a non-finite float
+    ("NaN"/"Infinity"/...). Such values are valid JSON strings here, but a
+    downstream pandas-based consumer (e.g. target-hubspot) coerces them back to
+    float NaN/Inf and re-emits them as the non-standard JSON tokens
+    ``NaN``/``Infinity``, which strict parsers (Jackson) reject — failing the
+    whole export.
+
     Args:
         df: DataFrame to prepare for Singer output
-        
+
     Returns:
         DataFrame with datetime columns converted to Singer-compatible strings
-        
+
     Raises:
         ValueError: If input is None instead of a DataFrame
-        
+
     Note:
         Singer format requires datetime fields to be in ISO 8601 format:
         YYYY-MM-DDTHH:MM:SS.ffffffZ
@@ -162,7 +213,7 @@ def prepare_for_singer(df: Optional[pd.DataFrame]) -> pd.DataFrame:
         raise ValueError("Expected DataFrame, received None")
 
     prepared_df = df.copy()
-    
+
     # Find all datetime columns
     datetime_cols = prepared_df.select_dtypes(include=["datetime", "datetimetz"]).columns
 
@@ -172,6 +223,28 @@ def prepare_for_singer(df: Optional[pd.DataFrame]) -> pd.DataFrame:
         formatted = series.dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ").where(series.notna(), None)
         prepared_df = prepared_df.astype({col: "object"})
         prepared_df.loc[:, col] = formatted
+
+    # Null out NaN/Infinity-spelling string values (see module note above).
+    # Only string/object columns can hold these spellings; numeric NaN is
+    # already serialized as JSON null by the Singer writer.
+    scrub_counts: Dict[str, int] = {}
+    string_cols = prepared_df.select_dtypes(include=["object", "string"]).columns
+    for col in string_cols:
+        counter = [0]
+        scrubbed = prepared_df[col].map(
+            lambda v: _scrub_nonfinite_float_strings(v, counter)
+        )
+        if counter[0]:
+            prepared_df[col] = scrubbed
+            scrub_counts[col] = counter[0]
+
+    if scrub_counts:
+        logger.warning(
+            "prepare_for_singer: replaced %d NaN/Infinity-spelling string value(s) "
+            "with null to keep downstream JSON standards-compliant (by column: %s)",
+            sum(scrub_counts.values()),
+            scrub_counts,
+        )
 
     return prepared_df
 
