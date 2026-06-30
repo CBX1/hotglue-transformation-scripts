@@ -164,16 +164,42 @@ def _spells_nonfinite_float(value: object) -> bool:
     return isinstance(value, str) and value in _NONFINITE_FLOAT_TOKENS
 
 
-# A number written with grouping/thousands separators, e.g. "1,316",
-# "1,234,567", "12,345.67". ast.literal_eval reads such a bare comma-separated
-# string as a Python tuple, which the downstream parser then turns into a JSON
-# array (see _parses_to_python_container). Stripping the separators restores the
-# intended scalar.
-_GROUPED_NUMBER_RE = re.compile(r"[+-]?\d{1,3}(?:,\d{3})+(?:\.\d+)?")
+# A number written with grouping commas and/or a trailing comma, with an
+# optional decimal — e.g. "1,316", "1,234,567", "298,", "12,345.67".
+# ast.literal_eval reads the comma form as a Python tuple ("298," -> (298,),
+# "1,316" -> (1, 316)), which the downstream serializes as a JSON array and
+# strict scalar (String) targets reject. Removing the commas restores the
+# intended numeric scalar. The pattern allows empty groups so a trailing comma
+# ("298,") is caught.
+_NUMERIC_COMMA_RE = re.compile(r"[+-]?\d*(?:,\d*)+(?:\.\d+)?")
+# Ambiguous European-decimal form ("12,34"): a single comma followed by 1-2
+# digits and no decimal point. There is no safe rewrite (could mean 12.34 or
+# 1234), so it is left flagged rather than guessed.
+_EURO_DECIMAL_RE = re.compile(r"[+-]?\d+,\d{1,2}")
+# A plain (comma-free) number used to validate the result after de-comma'ing.
+_PLAIN_NUMBER_RE = re.compile(r"[+-]?\d+(?:\.\d+)?")
 
 # A container literal must contain one of these; used as a cheap pre-filter so
 # we only attempt ast.literal_eval on the few values that could parse to one.
 _CONTAINER_HINT_CHARS = (",", "[", "{", "(")
+
+
+def _comma_number_scalar(value: str) -> Optional[str]:
+    """Return the intended numeric scalar for a number written with grouping
+    and/or a trailing comma ("1,316" -> "1316", "298," -> "298",
+    "12,345.67" -> "12345.67"), else None.
+
+    Returns None for anything that is not sign/digits/commas with an optional
+    decimal, for the ambiguous European-decimal form (see ``_EURO_DECIMAL_RE``),
+    and for values that do not reduce to a real number (e.g. ",").
+    """
+    s = value.strip()
+    if not _NUMERIC_COMMA_RE.fullmatch(s):
+        return None
+    if _EURO_DECIMAL_RE.fullmatch(s):
+        return None
+    stripped = s.replace(",", "")
+    return stripped if _PLAIN_NUMBER_RE.fullmatch(stripped) else None
 
 
 def _parses_to_python_container(value: object) -> bool:
@@ -209,14 +235,15 @@ def _sanitize_singer_value(value: object, counts: Dict[str, int]) -> object:
        otherwise re-emitted as the non-standard JSON tokens ``NaN``/``Infinity``
        and rejected by Jackson. (See ``_spells_nonfinite_float``.)
     2. Strings ``ast.literal_eval`` would turn into a container ("1,316" ->
-       ``(1, 316)``). A grouped number has its separators removed so it
-       round-trips as the intended scalar ("1,316" -> "1316"). Any *other*
-       container literal (e.g. "12,34", "[1, 2]") has no safe, connector-
-       agnostic rewrite — stripping commas would corrupt a European decimal,
-       and ``repr()``-wrapping would inject literal quotes for non-literal_eval
-       consumers like the CBX1 read path — so it is left UNCHANGED and only
-       flagged. A loud, isolated downstream failure is preferable to silently
-       dropping or corrupting data.
+       ``(1, 316)``, "298," -> ``(298,)``). A comma-formatted integer (grouping
+       and/or trailing comma) has its separators removed so it round-trips as
+       the intended scalar ("1,316" -> "1316", "298," -> "298"). Any *other*
+       container literal (e.g. the ambiguous European decimal "12,34", or
+       "[1, 2]") has no safe, connector-agnostic rewrite — stripping commas
+       would corrupt a decimal, and ``repr()``-wrapping would inject literal
+       quotes for non-literal_eval consumers like the CBX1 read path — so it is
+       left UNCHANGED and only flagged. A loud, isolated downstream failure is
+       preferable to silently dropping or corrupting data.
 
     Only values that are safely repairable are altered — every other string
     passes through untouched. Walks nested dicts/lists. ``counts`` accumulates
@@ -227,10 +254,10 @@ def _sanitize_singer_value(value: object, counts: Dict[str, int]) -> object:
             counts["nonfinite"] = counts.get("nonfinite", 0) + 1
             return None
         if _parses_to_python_container(value):
-            s = value.strip()
-            if _GROUPED_NUMBER_RE.fullmatch(s):
-                counts["regrouped_number"] = counts.get("regrouped_number", 0) + 1
-                return s.replace(",", "")
+            repaired = _comma_number_scalar(value)
+            if repaired is not None:
+                counts["comma_number"] = counts.get("comma_number", 0) + 1
+                return repaired
             counts["flagged_container"] = counts.get("flagged_container", 0) + 1
             return value
         return value
@@ -292,7 +319,7 @@ def prepare_for_singer(df: Optional[pd.DataFrame]) -> pd.DataFrame:
     # See _sanitize_singer_value for the rules.
     counts: Dict[str, int] = {}
     touched_cols: List[str] = []
-    _CHANGED = ("nonfinite", "regrouped_number")  # reasons that mutate the value
+    _CHANGED = ("nonfinite", "comma_number")  # reasons that mutate the value
     string_cols = prepared_df.select_dtypes(include=["object", "string"]).columns
     for col in string_cols:
         before = sum(counts.get(k, 0) for k in _CHANGED)

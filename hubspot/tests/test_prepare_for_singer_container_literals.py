@@ -33,8 +33,8 @@ from utils import (  # noqa: E402
 
 def test_detects_container_literals():
     # These become tuples/lists/dicts via ast.literal_eval -> JSON arrays/objects.
-    for s in ["1,316", "1,234,567", "12,345.67", "1,2", "(1, 2)", "[1, 2]",
-              "{'a': 1}", "1, 2, 3"]:
+    for s in ["1,316", "1,234,567", "12,345.67", "298,", "1,2", "(1, 2)",
+              "[1, 2]", "{'a': 1}", "1, 2, 3"]:
         assert _parses_to_python_container(s), s
 
 
@@ -46,7 +46,7 @@ def test_ignores_scalars_and_text():
 
 
 def test_regroups_grouped_number_zip():
-    # The exact production record that broke the export.
+    # The thoughtspot production record (zip "1,316").
     row = {
         "email": "laura.owen@fremontbank.com",
         "firstname": "Laura",
@@ -59,16 +59,28 @@ def test_regroups_grouped_number_zip():
     assert out["firstname"] == "Laura"
 
 
-def test_grouped_number_variants():
+def test_repairs_trailing_comma_address():
+    # The descope production record: address "298," -> (298,) tuple -> array.
+    row = {"email": "x@y.com", "address": "298,", "city": "Berlin"}
+    out = prepare_for_singer(pd.DataFrame([row])).to_dict(orient="records")[0]
+    assert out["address"] == "298"
+    assert out["city"] == "Berlin"
+
+
+def test_comma_number_variants():
     df = pd.DataFrame([{
-        "a": "1,234,567",   # -> "1234567"
-        "b": "12,345.67",   # -> "12345.67"
-        "c": "1,316",       # -> "1316"
+        "a": "1,234,567",   # grouping            -> "1234567"
+        "b": "12,345.67",   # grouping + decimal  -> "12345.67"
+        "c": "1,316",       # grouping            -> "1316"
+        "d": "298,",        # trailing comma      -> "298"
+        "e": "1,2,3",       # multi-comma integer -> "123"
     }])
     out = prepare_for_singer(df).to_dict(orient="records")[0]
     assert out["a"] == "1234567"
     assert out["b"] == "12345.67"
     assert out["c"] == "1316"
+    assert out["d"] == "298"
+    assert out["e"] == "123"
 
 
 def test_preserves_non_numeric_container_literal():
