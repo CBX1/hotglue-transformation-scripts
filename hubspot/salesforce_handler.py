@@ -9,8 +9,10 @@ including the Contact/Lead split functionality and field mapping transformations
 """
 
 import logging
+import re
 from typing import Dict, Optional
 
+import gluestick as gs
 import pandas as pd
 
 from base_handler import BaseETLHandler
@@ -52,66 +54,84 @@ class SalesforceHandler(BaseETLHandler):
     def handle_write(self) -> None:
         """
         Handle the write operation for Salesforce.
-        
-        This method:
-        1. Processes contact stream from the source
-        2. Applies Salesforce-specific transformations
-        3. Handles the Contact/Lead split based on account associations
-        4. Writes transformed data in Salesforce-compatible format
 
-        Note: As per policy, write jobs only push Contacts (no Accounts or other objects).
+        Processes the source streams CBX1 hands the write job:
+        - ``contacts`` -> split into Salesforce Contacts (account-linked) and Leads
+          (accountless), with field mapping and the Contact/Lead transformations.
+        - ``accounts`` -> Salesforce Accounts, when the flow has an ``accounts/Account`` mapping.
+
+        Accounts are written so the target connector can record the
+        ``CBX1-account-id -> SF-Account-Id`` snapshot that the contact split relies on to
+        attach Contacts to their Account (the snapshot is empty until accounts sync).
         """
         if not self.mapping_for_flow:
             raise ValueError("No write mapping found for Salesforce flow")
-        
-        mapping = self.build_write_mapping()
+
         streams = self.list_available_streams()
-        
-        logger.info(f"Salesforce write: evaluating {len(streams)} streams; only 'contacts' will be written")
-        
+        logger.info(f"Salesforce write: evaluating {len(streams)} streams")
+
         for stream in streams:
             if stream == "contacts":
                 # Special handling for contacts (split into Contacts/Leads)
-                self._handle_contacts_write(mapping)
+                self._handle_contacts_write()
+            elif stream == "accounts":
+                self._handle_accounts_write()
             else:
-                logger.info(f"Salesforce write: skipping non-contact stream '{stream}' by policy")
-    
-    def _handle_passthrough_stream(self, stream: str) -> None:
+                logger.info(f"Salesforce write: skipping unsupported stream '{stream}' by policy")
+
+    def _handle_accounts_write(self) -> None:
         """
-        Handle streams that don't have mapping (pass through as-is).
-        
-        Args:
-            stream: Name of the stream to pass through
+        Write CBX1 accounts to the Salesforce ``Account`` object.
+
+        Mirrors the HubSpot accounts path: map CBX1 -> Salesforce field names, dedupe against
+        the sent snapshot (re-including records whose content changed since the last sync), and
+        emit the Salesforce ``Account`` stream. The target connector creates/updates the SF
+        Account and records the ``InputId`` (CBX1 account id) -> ``RemoteId`` (SF Account Id)
+        snapshot that ``_handle_contacts_write`` uses to attach Contacts to their Account.
+
+        Opt-in: skipped gracefully when the flow has no ``accounts/Account`` mapping.
         """
-        logger.info(f"Passing through unmapped stream: {stream}")
-        df = self.get_stream_data(stream)
-        output_stream = self.stream_name_mapping.get(stream, stream)
-        self.write_to_singer(df, output_stream)
-    
-    def _handle_standard_stream_write(self, stream: str, mapping: Dict) -> None:
-        """
-        Handle standard stream write with mapping transformations.
-        
-        Args:
-            stream: Name of the stream to process
-            mapping: Field mapping configuration for transformation
-        """
-        logger.info(f"Processing standard stream: {stream}")
-        
-        # Read any previously sent data for deduplication
-        sent_data = self.read_snapshot(self.stream_name_mapping[stream])
-        
-        # Get and transform the data
-        stream_data = self.get_stream_data(stream)
-        stream_columns, stream_data = map_stream_data(stream_data, stream, mapping)
-        
-        # Filter out already sent records
-        stream_data = drop_sent_records(stream, stream_data, sent_data)
-        
-        # Write to output
-        self.write_to_singer(stream_data, self.stream_name_mapping[stream])
-    
-    def _handle_contacts_write(self, mapping: Dict) -> None:
+        # Connector-keyed mapping; the CBX1 ``accounts`` target maps to the SF ``Account`` object.
+        mapping_by_connector = self.build_connector_mapping()
+
+        if "Account" not in mapping_by_connector:
+            logger.info("No Account mapping configured for this flow, skipping accounts write")
+            return
+
+        accounts_df = self.get_stream_data("accounts")
+        if accounts_df is None or accounts_df.empty:
+            logger.info("No account records to write")
+            return
+
+        logger.info("Processing accounts for Salesforce")
+
+        # Apply field mapping (CBX1 -> Salesforce names); map_stream_data also adds externalId
+        # from the source `id` and keeps only mapped columns.
+        _, df_out = map_stream_data(accounts_df, "Account", mapping_by_connector)
+
+        # drop_sent_records / snapshots require externalId (egestion maps id -> externalId);
+        # guard defensively against a misconfigured mapping.
+        if "externalId" not in df_out.columns:
+            df_out["externalId"] = df_out["id"] if "id" in df_out.columns else None
+
+        # Dedupe against previously sent accounts, re-including any whose content changed since
+        # the last sync. (externalId-only dedup would make the path write-once and silently
+        # swallow CBX1 field updates — same fix as the HubSpot accounts path.)
+        snapshot_name = f"Account_{self.flow_id}"
+        sent_accounts = gs.read_snapshots(snapshot_name, self.snapshot_dir)
+        changed_accounts = gs.drop_redundant(
+            df_out.copy(),
+            f"{snapshot_name}.content",
+            self.snapshot_dir,
+            pk=["externalId"],
+            use_csv=True,
+        )
+        df_out = drop_sent_records("accounts", df_out, sent_accounts, changed_accounts)
+
+        self.write_to_singer(df_out, "Account")
+        logger.info(f"Processed {len(df_out)} Account records")
+
+    def _handle_contacts_write(self) -> None:
         """
         Handle contacts write with Salesforce-specific Contact/Lead split.
         
@@ -124,17 +144,21 @@ class SalesforceHandler(BaseETLHandler):
         """
         logger.info("Processing contacts with Contact/Lead split for Salesforce")
         
-        # Check if we have sent accounts (required for contact processing)
+        # A missing/empty accounts snapshot must not block contacts: with
+        # dynamic_contact_mapping on, accountless contacts route to Lead instead.
         sent_accounts = self.read_snapshot(self.stream_name_mapping.get('accounts', 'Account'))
-        if sent_accounts is None:
-            logger.warning("No accounts have been sent yet, skipping contacts export")
-            return
-        
-        # Prepare account data for joining
-        sent_accounts = sent_accounts.rename(
-            columns={"InputId": "AccountId", "RemoteId": "RemoteAccountId"}
-        )
-        sent_accounts = sent_accounts[sent_accounts["RemoteAccountId"].notna()]
+        if sent_accounts is None or sent_accounts.empty:
+            logger.info(
+                "No accounts sent yet; proceeding with contacts "
+                "(accountless contacts route to Lead when dynamic_contact_mapping is enabled)"
+            )
+            sent_accounts = pd.DataFrame(columns=["AccountId", "RemoteAccountId"])
+        else:
+            # Prepare account data for joining
+            sent_accounts = sent_accounts.rename(
+                columns={"InputId": "AccountId", "RemoteId": "RemoteAccountId"}
+            )
+            sent_accounts = sent_accounts[sent_accounts["RemoteAccountId"].notna()]
         
         # Get contact data
         contacts_df = self.get_stream_data("contacts")
@@ -143,12 +167,45 @@ class SalesforceHandler(BaseETLHandler):
         # Split contacts based on account association if configured
         if self.target_config.get("dynamic_contact_mapping"):
             logger.info("Applying dynamic contact mapping (Contact/Lead split)")
+            # Egestion omits accountId for contacts with no account; without the column the
+            # split would raise. Treat a missing column as "no account" so they route to Lead.
+            if contacts_df is not None and not contacts_df.empty and "accountId" not in contacts_df.columns:
+                contacts_df["accountId"] = None
+
+            # Hold back contacts whose account exists in CBX1 but hasn't synced to Salesforce
+            # yet. Otherwise they'd be written as Leads now and then duplicated as Contacts once
+            # the account lands (the account snapshot is populated by an account write). Records
+            # with no accountId at all are genuinely accountless and still become Leads.
+            if contacts_df is not None and not contacts_df.empty:
+                synced_account_ids = (
+                    set(sent_accounts["AccountId"]) if not sent_accounts.empty else set()
+                )
+                has_account = contacts_df["accountId"].notna() & (
+                    contacts_df["accountId"].astype(str).str.strip() != ""
+                )
+                pending = has_account & ~contacts_df["accountId"].isin(synced_account_ids)
+                pending_count = int(pending.sum())
+                if pending_count:
+                    logger.info(
+                        "Holding %d contact(s) whose account has not synced to Salesforce yet; "
+                        "they will sync as Contacts once the account lands",
+                        pending_count,
+                    )
+                    contacts_df = contacts_df[~pending].copy()
+
             contacts_df, leads_df = split_contacts_by_account(contacts_df, sent_accounts)
-        
+
+        # Connector-keyed mapping so Contact and Lead keep distinct field maps
+        # (build_write_mapping collapses both onto the `contacts` target).
+        mapping_by_connector = self.build_connector_mapping()
+
         # Process both Contact and Lead streams
         for sfdc_stream in ["Contact", "Lead"]:
+            if sfdc_stream not in mapping_by_connector:
+                logger.info(f"No mapping configured for {sfdc_stream}, skipping")
+                continue
             self._process_contact_stream(
-                sfdc_stream, contacts_df, leads_df, sent_accounts, mapping
+                sfdc_stream, contacts_df, leads_df, sent_accounts, mapping_by_connector
             )
     
     def _process_contact_stream(
@@ -157,7 +214,7 @@ class SalesforceHandler(BaseETLHandler):
         contacts_df: Optional[pd.DataFrame],
         leads_df: Optional[pd.DataFrame],
         sent_accounts: pd.DataFrame,
-        mapping: Dict,
+        mapping_by_connector: Dict,
     ) -> None:
         """
         Process a specific contact stream (Contact or Lead).
@@ -174,44 +231,54 @@ class SalesforceHandler(BaseETLHandler):
         if df is None or df.empty:
             logger.info(f"No data for {stream_type}, skipping")
             return
-        
-        # Find the mapping name for this stream
-        inverse = {v: k for k, v in self.stream_name_mapping.items()}
-        mapping_name = inverse.get(stream_type)
-        if not mapping_name:
+
+        if stream_type not in mapping_by_connector:
             logger.warning(f"No mapping found for {stream_type}, skipping")
             return
-        
-        # Apply field mapping
-        stream_columns, df = map_stream_data(df, mapping_name, mapping)
+
+        # Apply field mapping (CBX1 -> Salesforce field names) using this object's map
+        stream_columns, df = map_stream_data(df, stream_type, mapping_by_connector)
         new_data = df.copy()
-        
-        # Create snapshot for tracking
-        snap = self.write_snapshot(df, mapping_name)
+
+        # Create snapshot for tracking (keyed by Salesforce object: Contact / Lead)
+        snap = self.write_snapshot(df, stream_type)
         if "hash" in snap.columns:
             snap = snap.drop(columns=["hash"])
-        
-        # For Contacts (not Leads), merge in account remote IDs
-        if stream_type == "Contact":
-            snap = snap.merge(sent_accounts, on="AccountId")
+
+        # For Contacts (not Leads), attach the Salesforce account id. Left-join so a Contact
+        # whose account hasn't synced isn't silently dropped.
+        if stream_type == "Contact" and "AccountId" in snap.columns and not sent_accounts.empty:
+            snap = snap.merge(sent_accounts, on="AccountId", how="left")
             snap = snap.rename(
-                columns={
-                    "AccountId": "InputAccountId",
-                    "RemoteAccountId": "AccountId"
-                }
+                columns={"AccountId": "InputAccountId", "RemoteAccountId": "AccountId"}
             )
-        
+
         # Prepare final output
-        df_out = snap[list(set(stream_columns))].copy()
-        
-        # Filter out already sent records
-        sent_contacts = self.read_snapshot(self.stream_name_mapping[mapping_name])
+        available = [c for c in set(stream_columns) if c in snap.columns]
+        df_out = snap[available].copy()
+
+        # Salesforce requires Company on Leads, but the contact carries no company name.
+        # Interim: derive a placeholder Company from the email domain so Lead writes aren't
+        # rejected. Leads only (Contacts don't require Company).
+        if stream_type == "Lead" and "Email" in df_out.columns:
+            df_out["Company"] = df_out["Email"].apply(self._company_from_email)
+
+        # Filter out already sent records (snapshot keyed by Salesforce object)
+        sent_contacts = self.read_snapshot(stream_type)
         df_out = drop_sent_records("contacts", df_out, sent_contacts, new_data)
-        
-        # Write to output
-        self.write_to_singer(df_out, self.stream_name_mapping[mapping_name])
+
+        # Write to output (Salesforce object stream name)
+        self.write_to_singer(df_out, stream_type)
         logger.info(f"Processed {len(df_out)} {stream_type} records")
-    
+
+    @staticmethod
+    def _company_from_email(email):
+        """Placeholder Company for Leads (Salesforce requires it): the email domain."""
+        if not isinstance(email, str) or "@" not in email:
+            return None
+        domain = email.split("@")[-1].strip().lower()
+        return domain or None
+
     def handle_read(self) -> None:
         """
         Handle the read operation for Salesforce data.
@@ -229,162 +296,147 @@ class SalesforceHandler(BaseETLHandler):
             logger.warning("No streams or mapping available for read operation")
             return
         
-        mapping = self.build_read_mapping()
-        
-        # Only process relevant streams for data warehouse
-        target_streams = [s for s in data_streams if s in {"accounts", "contacts", "companies"}]
-        
+        # Route connector streams (Account/Contact/Lead) to their CBX1 target from the mapping
+        # keys. Contact and Lead both map to `contacts`; the backend owns field mapping.
+        connector_to_target = {}
+        for key in self.mapping_for_flow:
+            parts = key.split("/")
+            if len(parts) == 2:
+                target, connector = parts
+                connector_to_target[connector] = target
+
+        target_streams = [s for s in data_streams if s in connector_to_target]
+        if not target_streams:
+            logger.warning(
+                "No Salesforce streams matched the mapping (received=%s, mapped=%s)",
+                data_streams, list(connector_to_target.keys()),
+            )
         for stream in target_streams:
-            self._process_read_stream(stream, mapping)
+            self._process_read_stream(stream, connector_to_target[stream])
     
-    def _process_read_stream(self, stream: str, mapping: Dict) -> None:
+    def _process_read_stream(self, stream: str, output_stream: str) -> None:
         """
-        Process a single stream for read operation.
-        
+        Process a single Salesforce connector stream for the read (CRM -> CBX1) path.
+
+        Mirrors the HubSpot read path: enrich + wrap with RAW Salesforce field names; the
+        backend owns SF->CBX1 field mapping. The only field we synthesise here is `domain`
+        (Salesforce has no domain field where HubSpot companies do), because the account
+        lookupKey requires it.
+
         Args:
-            stream: Name of the stream to process
-            mapping: Field mapping configuration
+            stream: Salesforce connector stream name (e.g. "Account", "Contact", "Lead")
+            output_stream: CBX1 target stream the records belong to ("accounts"/"contacts")
         """
-        logger.info(f"Processing read stream: {stream}")
-        
+        logger.info(f"Processing read stream: {stream} -> {output_stream}")
+
         stream_data = self.get_stream_data(stream)
-        
-        if stream not in mapping:
-            logger.info(f"No mapping for stream {stream}, passing through")
-            self._write_read_output(stream_data, stream)
-            return
-        
-        # Apply field mapping and transformations
-        stream_data = self._apply_read_mapping(stream_data, stream, mapping[stream])
-        
-        # Enrich with CBX1 IDs from snapshots
-        stream_data = self._enrich_with_cbx1_ids(stream_data, stream)
-        
-        # Handle special case for contacts with account IDs
-        if stream == "contacts":
+
+        # Drop Salesforce soft-deleted records (parallels HubSpot's archived filter)
+        stream_data = self._filter_deleted_records(stream_data)
+
+        if output_stream == "accounts":
+            # Salesforce has no domain field; synthesise one from Website for the lookupKey.
+            stream_data = self._derive_domain_from_website(stream_data)
+            lookup_field = "domain"
+        else:
             stream_data = self._update_contact_account_ids(stream_data)
-        
-        # Add CRM system identifier
-        stream_data = self._add_crm_system(stream_data)
-        
-        # Transform dot notation to nested structures
+            lookup_field = "Email"  # contacts/leads match by email
+
+        # Normalise any dot-notation fields into nested objects
         stream_data = transform_dot_notation_to_nested(stream_data)
-        
-        # Determine output stream name
-        inverse_mapping = {v: k for k, v in self.stream_name_mapping.items()}
-        output_stream = inverse_mapping.get(stream, stream)
-        
-        self._write_read_output(stream_data, output_stream)
+
+        # Wrap for cbx1-target; raw Salesforce field names stay inside `data` for the backend to map.
+        wrapped = self._wrap_records_with_metadata(
+            stream_data, output_stream, source="SALESFORCE", id_field="Id", lookup_field=lookup_field
+        )
+        self._write_read_output(wrapped, output_stream)
+
+    def _filter_deleted_records(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Remove Salesforce soft-deleted records (IsDeleted == true)."""
+        if df is None or df.empty or "IsDeleted" not in df.columns:
+            return df
+        mask = df["IsDeleted"].fillna(False).astype(bool)
+        removed = int(mask.sum())
+        if removed:
+            logger.info("Salesforce read: skipped %d IsDeleted record(s)", removed)
+        return df.loc[~mask].copy()
     
-    def _apply_read_mapping(self, df: pd.DataFrame, stream: str, mapping: Dict) -> pd.DataFrame:
+    def _derive_domain_from_website(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Apply read mapping to transform field names.
-        
-        Args:
-            df: DataFrame to transform
-            stream: Name of the stream
-            mapping: Field mapping configuration
-            
-        Returns:
-            Transformed DataFrame with mapped field names
+        Derive a clean `domain` from the raw Salesforce `Website` field.
+
+        Salesforce Accounts have no domain field, only Website (e.g. "http://edgecomm.com",
+        "www.burlington.com"). CBX1 matches accounts by domain, so we normalise Website into
+        a bare host ("edgecomm.com", "burlington.com") and add it as `domain`, leaving the
+        raw Website in place for the backend mapping.
         """
+        import re
+
+        if df is None or df.empty:
+            return df
+        if "Website" not in df.columns:
+            # `domain` is the account lookupKey and is derived solely from Website. If the
+            # tap catalog omits Website we can derive no domain, and every Account would be
+            # silently dropped downstream. Fail loudly — this is a catalog misconfiguration.
+            raise ValueError(
+                "Salesforce Account read: 'Website' is absent from the tap catalog, so no "
+                "'domain' lookupKey can be derived and every Account would be dropped. Add "
+                "'Website' to the Salesforce tap catalog."
+            )
+
+        def _clean(value):
+            if value is None or (isinstance(value, float) and pd.isna(value)):
+                return None
+            host = str(value).strip()
+            if not host:
+                return None
+            host = re.sub(r"^https?://", "", host, flags=re.IGNORECASE)
+            host = host.split("/")[0].split("?")[0]
+            if host.lower().startswith("www."):
+                host = host[4:]
+            return host.lower() or None
+
         df = df.copy()
-        
-        # Rename columns based on mapping
-        for source_col, target_col in mapping.items():
-            if target_col in df.columns:
-                df[source_col] = df[target_col]
-        
-        # Keep only mapped columns plus remote_id
-        columns = list(mapping.keys())
-        if "remote_id" in df.columns:
-            columns.append("remote_id")
-        
-        # Ensure unique columns
-        unique_columns = []
-        for col in columns:
-            if col not in unique_columns and col in df.columns:
-                unique_columns.append(col)
-        
-        return df[unique_columns].copy()
-    
-    def _enrich_with_cbx1_ids(self, df: pd.DataFrame, stream: str) -> pd.DataFrame:
-        """
-        Enrich data with CBX1 IDs from previous snapshots.
-        
-        Args:
-            df: DataFrame to enrich
-            stream: Name of the stream
-            
-        Returns:
-            DataFrame with CBX1 IDs added where available
-        """
-        if "remote_id" not in df.columns:
-            return df
-        
-        sent_data = self.read_snapshot(stream)
-        if sent_data is None:
-            return df
-        
-        sent_data = sent_data.rename(columns={"InputId": "id", "RemoteId": "remote_id"})
-        return df.merge(sent_data[["id", "remote_id"]], how="left", on="remote_id")
-    
+        df["domain"] = df["Website"].apply(_clean)
+        return df
+
     def _update_contact_account_ids(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Update contact account IDs with CBX1 account IDs.
-        
+        Update Contact/Lead account IDs with CBX1 account IDs.
+
         Args:
-            df: Contacts DataFrame
-            
+            df: Contact or Lead DataFrame with a Salesforce AccountId field
+
         Returns:
             DataFrame with updated account IDs
         """
-        if "accountId" not in df.columns:
+        # Resolve the raw Salesforce AccountId -> CBX1 account id via the accounts
+        # snapshot, exposed as `accountId`; the raw AccountId is left untouched.
+        if df is None or df.empty or "AccountId" not in df.columns:
             return df
-        
+
         account_snapshots = self.read_snapshot("Account")
-        if account_snapshots is None:
+        if account_snapshots is None or account_snapshots.empty:
             return df
-        
-        # Prepare account mapping
+
         acc = account_snapshots.rename(
-            columns={
-                "InputId": "cbx1_account_id",
-                "RemoteId": "salesforce_account_id"
-            }
+            columns={"InputId": "cbx1_account_id", "RemoteId": "salesforce_account_id"}
         ).copy()
-        
-        # Normalize IDs as strings for matching
-        df["accountId"] = df["accountId"].astype(str)
+
+        df = df.copy()
+        df["_sf_account_id"] = df["AccountId"].astype(str)
         acc["salesforce_account_id"] = acc["salesforce_account_id"].astype(str)
-        
-        # Merge to get CBX1 account IDs
+
         df = df.merge(
             acc[["salesforce_account_id", "cbx1_account_id"]],
-            left_on="accountId",
+            left_on="_sf_account_id",
             right_on="salesforce_account_id",
             how="left",
         )
-        
-        # Replace account ID with CBX1 ID
         df["accountId"] = df["cbx1_account_id"]
-        df = df.drop(columns=["salesforce_account_id", "cbx1_account_id"], errors="ignore")
-        
-        return df
-    
-    def _add_crm_system(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Add CRM system identifier to the data.
-        
-        Args:
-            df: DataFrame to add CRM system to
-            
-        Returns:
-            DataFrame with crmSystem column added
-        """
-        df = df.copy()
-        df["crmSystem"] = "SALESFORCE"
-        df = df.rename(columns={"remote_id": "crmAssociationId"})
+        df = df.drop(
+            columns=["_sf_account_id", "salesforce_account_id", "cbx1_account_id"], errors="ignore"
+        )
         return df
     
     def _write_read_output(self, df: pd.DataFrame, stream_name: str) -> None:
@@ -397,3 +449,89 @@ class SalesforceHandler(BaseETLHandler):
         """
         self.write_to_singer(df, stream_name)
         logger.info(f"Wrote {len(df)} records for read stream: {stream_name}")
+
+    def _wrap_records_with_metadata(
+        self,
+        df: pd.DataFrame,
+        stream: str,
+        source: str,
+        lookup_field: Optional[str] = None,
+        id_field: Optional[str] = None,
+    ) -> pd.DataFrame:
+        """
+        Wrap each flat record into the cbx1-target envelope
+        {data, sourceRecordId, source, lookupKey}. Individual records whose
+        lookupKey value is null/empty are dropped so the backend can always
+        match; a missing id or lookup *column* (the tap catalog omitted the
+        field entirely) raises, rather than silently emptying the stream.
+
+        lookup_field defaults to ``email`` for contact/lead streams and
+        ``domain`` otherwise; id_field defaults to ``id``/``Id``.
+        """
+        if df is None or df.empty:
+            return df
+
+        stream_lower = stream.lower()
+        if lookup_field is None:
+            lookup_field = (
+                "email"
+                if ("contact" in stream_lower or "lead" in stream_lower)
+                else "domain"
+            )
+
+        if id_field is not None:
+            id_col = id_field if id_field in df.columns else None
+        else:
+            id_col = "id" if "id" in df.columns else ("Id" if "Id" in df.columns else None)
+        # A missing id or lookup column means the tap catalog omitted a field every record
+        # needs to be matched in CBX1. Returning empty here would silently drop the whole
+        # stream while still reporting success, so fail loudly — by this point the frame is
+        # non-empty (genuinely empty frames returned above), so this is a misconfiguration.
+        if id_col is None:
+            raise ValueError(
+                f"Cannot wrap '{stream}' records: id field "
+                f"'{id_field or 'id/Id'}' is absent from the tap catalog."
+            )
+        if lookup_field not in df.columns:
+            raise ValueError(
+                f"Cannot wrap '{stream}' records: lookup field '{lookup_field}' is absent "
+                f"from the tap catalog. It is required to match records in CBX1."
+            )
+
+        initial = len(df)
+        # Filter first, then copy only the kept subset (avoids copying the full frame).
+        df = df[df[lookup_field].notna() & (df[lookup_field].astype(str).str.strip() != "")].copy()
+        dropped = initial - len(df)
+        if dropped:
+            logger.info(
+                "Filtered %d '%s' record(s) with null/empty %s", dropped, stream, lookup_field
+            )
+        if df.empty:
+            return df
+
+        df = df.replace({pd.NaT: None})
+        records = df.to_dict(orient="records")
+        wrapped = [
+            {
+                "data": self._clean_record_for_serialization(rec),
+                "sourceRecordId": rec.get(id_col),
+                "source": source,
+                "lookupKey": rec.get(lookup_field),
+            }
+            for rec in records
+        ]
+        logger.info("Wrapped %d '%s' records with source='%s'", len(wrapped), stream, source)
+        return pd.DataFrame(wrapped)
+
+    def _clean_record_for_serialization(self, obj):
+        """Recursively convert pandas NaT/NA to None so records JSON-serialize cleanly."""
+        if isinstance(obj, dict):
+            return {k: self._clean_record_for_serialization(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [self._clean_record_for_serialization(item) for item in obj]
+        try:
+            if pd.isna(obj):
+                return None
+        except (ValueError, TypeError):
+            pass
+        return obj
