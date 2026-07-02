@@ -74,6 +74,10 @@ All ETL output passes through `prepare_for_singer()` (datetimes → ISO strings;
 3. **Tap stage (CBX1 read):** run `tap-cbx1` locally against QA — see `cbx1-tap-hotglue/README.md` debugging playbook (auth, keyset pagination, state).
 4. **Target stage (CBX1 write):** feed the job's `etl-output/data.singer` into `target-cbx1` locally against QA — see `cbx1-target-hotglue/README.md` (lookupKey skips, per-record errors, replayable cURL).
 
+## Deployment
+
+The transformation script auto-deploys from GitHub Actions: `main` → `dev.different.ai`, `production` → `prod.different.ai`, once per connector slot (hubspot + salesforce; **not marketo**). Full details: this repo's README → "Deployment". The tap and target repos have their own deploy paths (none in-repo for the tap; Jenkins for the target).
+
 ## Credentials quick reference
 
 - `Code` / `OrgId`: from the tenant's Descope access key for the CBX1 IDM (`api/g/v1/auth/tokens`). Same pair works for tap and target. Ask in #eng-crm-self-serve for QA-tenant credentials.

@@ -295,6 +295,26 @@ Verify before opening a PR:
 3. Check `snapshots/` diffs: updated, nothing unintentionally deleted.
 4. Run **both** job types if the change touches shared code (`utils.py`, `base_handler.py`).
 
+## Deployment
+
+Deployment is automated via [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml) — there is no manual deploy step in normal operation.
+
+**Branch → environment mapping (know this before merging):**
+
+| Trigger | Target HotGlue environment |
+|---|---|
+| Push to `main` | `dev.different.ai` |
+| Push to `production` | `prod.different.ai` |
+| Manual `workflow_dispatch` | Chosen env; a guard job **rejects** `prod.different.ai` unless dispatched from the `production` branch |
+
+⚠️ **Merging to `main` deploys to dev immediately** (and `production` to prod). Doc-only changes (`README.md`, `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, `.gitignore`) are excluded via `paths-ignore` and do not trigger a deploy.
+
+**What a deploy does:** uploads `./hubspot` with `npx @hotglue/cli@1.1.0 etl deploy` for flow `AJ3x0LMYI` (hardcoded), once **per connector slot** — a `for TAP in hubspot salesforce` loop. The flow is bidirectional, so the ETL must land in *each* supported connector's slot; deploying only one previously left the other running stale code.
+
+> **Note:** `marketo` is **not** in the deploy loop even though `marketo_handler.py` exists — a Marketo slot would run whatever was last deployed manually. Add it to the loop before relying on Marketo in any environment.
+
+**Mechanics:** runs on the self-hosted `cbx1-gcp-runner-small` runner, authenticates with the `HOTGLUE_API_KEY` repository secret (verified present before deploying), and deploys are serialized per target env via a concurrency group so concurrent prod deploys can't interleave. Manual deploys: Actions → "Deploy ETL to HotGlue" → Run workflow.
+
 ## Monitoring and Debugging
 
 ### Log Output
