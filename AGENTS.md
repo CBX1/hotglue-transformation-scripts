@@ -9,4 +9,4 @@ Agent-specific ground rules:
 - **Respect the Write Policy** (README → Write Policy): streams absent from the flow's mapping are intentionally not written; Salesforce contacts without a synced account are intentionally held back. Neither is a bug.
 - **Don't "generalize" the NaN/Infinity token scrub** in `prepare_for_singer` — matching is exact and case-sensitive on purpose (prod incident: `"NaN"` broke the HubSpot export, `"Nan"` is a valid name). The tests in `hubspot/tests/` encode this.
 - Run `pytest hubspot/tests/` before and after touching `utils.py`/serialization paths.
-- To reproduce a real HotGlue job locally: `docs/local-job-debugging.md`. For mapping/handler development: README → "How a job executes" and "Development workflow".
+- To reproduce a real HotGlue job locally: use the `local-job-debugging` skill (`.claude/skills/local-job-debugging/`). For mapping/handler development: README → "How a job executes" and "Development workflow".

@@ -54,8 +54,8 @@ The system supports two job types:
 ```
 .
 ├── docs/
-│   ├── architecture.md         # End-to-end pipeline documentation
-│   └── local-job-debugging.md  # Replicate a real HotGlue job locally (hotglue CLI)
+│   └── architecture.md         # End-to-end pipeline documentation
+├── .claude/skills/             # AI workflows (local-job-debugging)
 └── hubspot/                    # ← ALL connectors live here (historical name)
     ├── etl.py                  # Main orchestrator/entrypoint
     ├── base_handler.py         # Abstract base for connector handlers
@@ -270,7 +270,7 @@ python etl.py
 
 ### Replicating a real HotGlue job locally
 
-To debug a failed production/QA job with its exact input data and env vars, use the hotglue CLI (`hotglue etl setup-local-run` + `hotglue etl local-run`) — workflow documented in [`docs/local-job-debugging.md`](docs/local-job-debugging.md).
+A failed production/QA job can be reproduced locally with its exact input data and env vars (hotglue CLI: `setup-local-run` + `local-run`). This is an AI-assisted workflow — ask Claude to debug the failed job and it will follow the [`local-job-debugging` skill](.claude/skills/local-job-debugging/SKILL.md); the skill file documents the full manual procedure if you ever need it yourself.
 
 ### Running the tests
 ```bash
