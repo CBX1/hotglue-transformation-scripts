@@ -41,12 +41,21 @@ The system supports two job types:
 - Injects CRM system identifiers
 - Maintains remote ID associations
 
+### How a job executes (mental model)
+
+1. `etl.py` loads `snapshots/tenant-config.json` → `hotglue_mapping.mapping.{FLOW}` and derives `stream_name_mapping` from its `target/connector` keys (e.g. `"contacts/Contact"` → contacts maps to SF Contact). **A stream absent from the mapping is not written** — that's the write-policy opt-in signal.
+2. The connector handler (`{connector}_handler.py`, subclass of `base_handler.py`) implements `handle_write()` / `handle_read()`.
+3. Write path: `gs.Reader(sync-output)` → `map_stream_data()` (field mapping) → `drop_sent_records()` (dedupe vs `snapshots/{stream}_{FLOW}.snapshot.csv`) → connector-specific logic (e.g. `split_contacts_by_account()` for SF Contact/Lead) → `write_to_singer()` → `etl-output/data.singer`.
+4. Read path: CRM parquet → field normalization → inject `crmSystem`, rename `remote_id`→`crmAssociationId`, set `lookupKey` → Singer output for `cbx1-target-hotglue`.
+5. All output goes through `prepare_for_singer()`: datetimes → ISO strings, exact NaN/Infinity string tokens nulled (case-sensitive — see `hubspot/tests/`).
+
 ## Directory Structure
 
 ```
 .
 ├── docs/
-│   └── architecture.md         # End-to-end pipeline documentation
+│   ├── architecture.md         # End-to-end pipeline documentation
+│   └── local-job-debugging.md  # Replicate a real HotGlue job locally (hotglue CLI)
 └── hubspot/                    # ← ALL connectors live here (historical name)
     ├── etl.py                  # Main orchestrator/entrypoint
     ├── base_handler.py         # Abstract base for connector handlers
@@ -238,12 +247,16 @@ pip install -r requirements.txt
 **Important**: the HotGlue directories (`sync-output/`, `snapshots/`, `etl-output/`) must remain intact — idempotency and dedupe depend on them. Mapping configuration is tenant-driven and read from `snapshots/tenant-config.json` at runtime.
 
 ### Running a Write Job
+
+`hubspot/sync-output/` ships curated QA parquet fixtures (companies, contacts, owners, lists, …) and `snapshots/` a matching `tenant-config.json` for flow `AJ3x0LMYI`, so a job runs out of the box:
+
 ```bash
 cd hubspot
 export JOB_TYPE=write
 export FLOW=AJ3x0LMYI
 export CONNECTOR_ID=salesforce
 python etl.py
+head -3 etl-output/data.singer     # inspect the result
 ```
 
 ### Running a Read Job
@@ -257,12 +270,25 @@ python etl.py
 
 ### Replicating a real HotGlue job locally
 
-To debug a failed production/QA job with its exact input data and env vars, use the hotglue CLI (`hotglue etl setup-local-run` + `hotglue etl local-run`) — workflow documented in `.claude/skills/local-job-debugging/`.
+To debug a failed production/QA job with its exact input data and env vars, use the hotglue CLI (`hotglue etl setup-local-run` + `hotglue etl local-run`) — workflow documented in [`docs/local-job-debugging.md`](docs/local-job-debugging.md).
 
 ### Running the tests
 ```bash
 pytest hubspot/tests/    # from the repo root
 ```
+
+### Development workflow (making a change)
+
+- **Mapping logic change:** update `snapshots/tenant-config.json` locally to exercise it; craft minimal parquet inputs in `sync-output/` if the fixtures don't cover the case (`pd.DataFrame(...).to_parquet('sync-output/contacts-<ts>.parquet')`).
+- **Dedupe-sensitive change:** `drop_sent_records()` consults the snapshot — delete/edit the local `snapshots/{stream}_{FLOW}.snapshot.csv` to force records through, and check the snapshot is written back correctly after the run.
+- **New connector:** subclass `base_handler.py`, register in `etl.py::_get_handler`, follow the existing handler layout.
+
+Verify before opening a PR:
+
+1. `pytest hubspot/tests/` (from repo root) — serialization regressions.
+2. Inspect `etl-output/data.singer`: SCHEMA line per stream, RECORD lines carry `lookupKey` + `sourceRecordId` (CBX1-bound), datetimes are ISO strings.
+3. Check `snapshots/` diffs: updated, nothing unintentionally deleted.
+4. Run **both** job types if the change touches shared code (`utils.py`, `base_handler.py`).
 
 ## Monitoring and Debugging
 
@@ -291,10 +317,15 @@ The script provides detailed logging for:
 
 ### Common Issues
 
-1. **No accounts sent**: Contacts processing skipped if no accounts available
-2. **Missing mapping**: Streams processed without transformation if mapping unavailable
-3. **Configuration errors**: Check tenant-config.json format and field mappings
-4. **Connector mismatch**: Verify CONNECTOR_ID matches expected values
+1. **Ran from repo root** → `sync-output` not found / empty output. `cd hubspot` first.
+2. **No accounts sent**: Contacts processing skipped if no accounts available
+3. **Contacts silently held back (Salesforce)**: their account hasn't synced yet — by design (see [Write Policy](#write-policy)), not a bug
+4. **Stream "ignored"**: no `{stream}/{Object}` key in the flow's mapping — the write-policy opt-in signal
+5. **Everything re-sent**: missing/blown-away snapshot file (dedupe state lives in `snapshots/`)
+6. **Missing mapping**: Streams processed without transformation if mapping unavailable
+7. **Configuration errors**: Check tenant-config.json format and field mappings
+8. **Connector mismatch**: Verify CONNECTOR_ID matches expected values
+9. **`"NaN"` vs `"Nan"`**: the serialization token scrub is exact and case-sensitive on purpose (prod incident) — don't "generalize" it
 
 ### Debug Steps
 

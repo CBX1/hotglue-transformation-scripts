@@ -70,7 +70,7 @@ All ETL output passes through `prepare_for_singer()` (datetimes → ISO strings;
 ## Debugging a job — where to start
 
 1. **Which stage failed?** HotGlue job logs show tap, ETL, and target phases separately.
-2. **ETL stage:** replicate the exact job locally with the hotglue CLI (`hotglue etl setup-local-run <job>` then `hotglue etl local-run`) — see `.claude/skills/local-job-debugging/` in this repo.
+2. **ETL stage:** replicate the exact job locally with the hotglue CLI (`hotglue etl setup-local-run <job>` then `hotglue etl local-run`) — see `docs/local-job-debugging.md` in this repo.
 3. **Tap stage (CBX1 read):** run `tap-cbx1` locally against QA — see `cbx1-tap-hotglue/README.md` debugging playbook (auth, keyset pagination, state).
 4. **Target stage (CBX1 write):** feed the job's `etl-output/data.singer` into `target-cbx1` locally against QA — see `cbx1-target-hotglue/README.md` (lookupKey skips, per-record errors, replayable cURL).
 
