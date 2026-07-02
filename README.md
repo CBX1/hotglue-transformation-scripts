@@ -1,6 +1,10 @@
 # HotGlue Transformation Scripts
 
-This repository contains transformation scripts for integrating CBX1 App with CRM systems (HubSpot and Salesforce) using the HotGlue platform.
+This repository contains transformation scripts for integrating CBX1 App with CRM systems (Salesforce, HubSpot, Marketo) using the HotGlue platform.
+
+> **⚠️ All code lives under `hubspot/`** (historical name — it hosts ALL connectors). Run `etl.py` from inside `hubspot/`, not the repo root.
+>
+> **Agents / detailed guidance:** [`AGENTS.md`](AGENTS.md). **End-to-end pipeline (tap → this ETL → target):** [`docs/architecture.md`](docs/architecture.md).
 
 ## Overview
 
@@ -41,17 +45,21 @@ The system supports two job types:
 
 ```
 .
-├── etl.py                  # Main orchestrator/entrypoint
-├── base_handler.py         # Abstract base for connector handlers
-├── salesforce_handler.py   # Salesforce write/read business logic
-├── hubspot_handler.py      # HubSpot write/read business logic
-├── marketo_handler.py      # Marketo write/read business logic
-├── utils.py                # Shared helpers
-├── requirements.txt        # Python dependencies
-├── .hotgluerc              # HotGlue flow/env/tap config
-├── sync-output/            # Input data from HotGlue
-├── snapshots/              # Tracking previously sent records
-└── etl-output/             # Output data in Singer format
+├── docs/
+│   └── architecture.md         # End-to-end pipeline documentation
+└── hubspot/                    # ← ALL connectors live here (historical name)
+    ├── etl.py                  # Main orchestrator/entrypoint
+    ├── base_handler.py         # Abstract base for connector handlers
+    ├── salesforce_handler.py   # Salesforce write/read business logic
+    ├── hubspot_handler.py      # HubSpot write/read business logic
+    ├── marketo_handler.py      # Marketo write/read business logic
+    ├── utils.py                # Shared helpers
+    ├── requirements.txt        # Python dependencies
+    ├── .hotgluerc              # HotGlue flow/env/tap config
+    ├── tests/                  # pytest suite (run from repo root)
+    ├── sync-output/            # Input data from HotGlue (sample fixtures committed)
+    ├── snapshots/              # Tracking previously sent records + tenant-config.json
+    └── etl-output/             # Output data in Singer format
 ```
 
 ## Configuration
@@ -194,6 +202,10 @@ Returns appropriate contact data based on connector and stream type.
 - **Features**: Association handling, nested object formatting
 - **Special Handling**: HubSpot-specific association format
 
+### Marketo
+- **Streams**: Contact-centric (see `hubspot/marketo_handler.py`)
+- **Features**: Same handler interface as Salesforce/HubSpot
+
 ## Error Handling
 
 - Graceful handling of missing configurations
@@ -212,6 +224,7 @@ Returns appropriate contact data based on connector and stream type.
 
 ### Running a Write Job
 ```bash
+cd hubspot
 export JOB_TYPE=write
 export FLOW=AJ3x0LMYI
 export CONNECTOR_ID=salesforce
@@ -220,10 +233,20 @@ python etl.py
 
 ### Running a Read Job
 ```bash
+cd hubspot
 export JOB_TYPE=read
 export FLOW=AJ3x0LMYI
 export CONNECTOR_ID=hubspot
 python etl.py
+```
+
+### Replicating a real HotGlue job locally
+
+To debug a failed production/QA job with its exact input data and env vars, use the hotglue CLI (`hotglue etl setup-local-run` + `hotglue etl local-run`) — workflow documented in `.claude/skills/local-job-debugging/`.
+
+### Running the tests
+```bash
+pytest hubspot/tests/    # from the repo root
 ```
 
 ## Monitoring and Debugging

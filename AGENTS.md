@@ -1,7 +1,11 @@
 # Repository Guidelines
 
+HotGlue **in-flow transformation** (`etl.py`) that maps CRM data between CBX1 and CRM systems (Salesforce, HubSpot, Marketo) for bidirectional sync. It is neither a tap nor a target — it runs inside HotGlue between them. End-to-end pipeline documentation: `docs/architecture.md`.
+
+> **⚠️ Working directory:** all code and job data live under `hubspot/` (a historical name — it hosts ALL connectors, including Salesforce and Marketo). Run `etl.py` from inside `hubspot/`; running it from the repo root finds no `sync-output/` and produces nothing. Tests, by contrast, run from the repo root (`pytest hubspot/tests/`).
+
 ## Project Structure & Module Organization
-The ETL has been refactored into a clear, modular architecture with strict separation of read/write paths and per-connector logic.
+The ETL has been refactored into a clear, modular architecture with strict separation of read/write paths and per-connector logic. All paths below are relative to `hubspot/`.
 
 - `etl.py` — Main orchestrator/entrypoint. Loads env/config, resolves the connector, and delegates to the right handler. No business rules live here.
 - `base_handler.py` — Abstract base class providing shared utilities:
@@ -14,6 +18,7 @@ The ETL has been refactored into a clear, modular architecture with strict separ
   - Write: standard stream mapping for contacts/accounts/companies
   - Read: optional owner enrichment (name/email) when `owners` stream is present
   - Associations: deliberately NOT handled here; HubSpot applies its own association rules
+- `marketo_handler.py` — Marketo-specific business logic (same handler interface)
 - `utils.py` — Shared helpers with comprehensive docstrings:
   - `get_stream_data()`, `map_stream_data()`, `drop_sent_records()`, `transform_dot_notation_to_nested()`
   - Contact helpers: `split_contacts_by_account()`, `get_contact_data()`
@@ -34,15 +39,18 @@ python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Run jobs from the repository root by exporting the required environment variables:
+Run jobs **from inside `hubspot/`** by exporting the required environment variables:
 
 - `JOB_TYPE`: `write` (to CRM) or `read` (from CRM to DW). Default: `write`.
 - `FLOW`: Flow identifier used for mapping/snapshots. Example: `AJ3x0LMYI`.
-- `CONNECTOR_ID`: `salesforce` or `hubspot`.
+- `CONNECTOR_ID`: `salesforce`, `hubspot`, or `marketo`.
+- `ROOT_DIR`: base for `sync-output/`/`snapshots/`/`etl-output/` (default `.` — another reason the working directory matters).
 
 Examples:
 
 ```bash
+cd hubspot
+
 # Write job to Salesforce
 JOB_TYPE=write FLOW=AJ3x0LMYI CONNECTOR_ID=salesforce python etl.py
 
@@ -56,11 +64,19 @@ JOB_TYPE=write FLOW=AJ3x0LMYI CONNECTOR_ID=hubspot python etl.py
 JOB_TYPE=read FLOW=AJ3x0LMYI CONNECTOR_ID=hubspot python etl.py
 ```
 
+To replicate a real (e.g. failed) HotGlue job locally — including its exact `sync-output/`, snapshots, and env vars — use the hotglue CLI workflow in `.claude/skills/local-job-debugging/`.
+
 ## Coding Style & Naming Conventions
 Follow PEP 8 conventions: four-space indentation, snake_case for functions/variables, and CapWords for classes. Type hints are present in critical paths—add them to new helpers. Reuse the shared logger configured in `etl.py` and prefer descriptive, imperative function names (e.g., `split_contacts_by_account`).
 
 ## Testing Guidelines
-No automated test suite exists yet—use targeted job runs:
+A pytest suite exists under `hubspot/tests/` (currently covering `prepare_for_singer` serialization edge cases — NaN/Infinity tokens, container literals). Run it from the repo root:
+
+```bash
+pytest hubspot/tests/
+```
+
+For behavior the suite doesn't cover, use targeted job runs:
 
 1. Run both `write` and `read` jobs against representative `sync-output/` payloads.
 2. Inspect generated Singer files under `etl-output/` and verify schema/values.
