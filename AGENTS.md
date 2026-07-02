@@ -1,103 +1,12 @@
-# Repository Guidelines
+# Agent Guide — hotglue-transformation-scripts
 
-HotGlue **in-flow transformation** (`etl.py`) that maps CRM data between CBX1 and CRM systems (Salesforce, HubSpot, Marketo) for bidirectional sync. It is neither a tap nor a target — it runs inside HotGlue between them. End-to-end pipeline documentation: `docs/architecture.md`.
+**`README.md` is the authoritative documentation** for this repo: architecture, directory structure, env vars, tenant mapping config, write policy, usage, troubleshooting, and contributing guidelines. Read it first; don't duplicate its content here. End-to-end pipeline (tap → this ETL → target): `docs/architecture.md`.
 
-> **⚠️ Working directory:** all code and job data live under `hubspot/` (a historical name — it hosts ALL connectors, including Salesforce and Marketo). Run `etl.py` from inside `hubspot/`; running it from the repo root finds no `sync-output/` and produces nothing. Tests, by contrast, run from the repo root (`pytest hubspot/tests/`).
+Agent-specific ground rules:
 
-## Project Structure & Module Organization
-The ETL has been refactored into a clear, modular architecture with strict separation of read/write paths and per-connector logic. All paths below are relative to `hubspot/`.
-
-- `etl.py` — Main orchestrator/entrypoint. Loads env/config, resolves the connector, and delegates to the right handler. No business rules live here.
-- `base_handler.py` — Abstract base class providing shared utilities:
-  - Stream listing, snapshot read/write, Singer output (`write_to_singer()`), and mapping helpers
-  - Enforces a common interface: `handle_write()` and `handle_read()`
-- `salesforce_handler.py` — Salesforce-specific business logic:
-  - Write: standard stream mapping and Contact/Lead split via `split_contacts_by_account()`
-  - Read: field normalization for DW, CBX1 id enrichment, AccountId fix-up for contacts
-- `hubspot_handler.py` — HubSpot-specific business logic:
-  - Write: standard stream mapping for contacts/accounts/companies
-  - Read: optional owner enrichment (name/email) when `owners` stream is present
-  - Associations: deliberately NOT handled here; HubSpot applies its own association rules
-- `marketo_handler.py` — Marketo-specific business logic (same handler interface)
-- `utils.py` — Shared helpers with comprehensive docstrings:
-  - `get_stream_data()`, `map_stream_data()`, `drop_sent_records()`, `transform_dot_notation_to_nested()`
-  - Contact helpers: `split_contacts_by_account()`, `get_contact_data()`
-
-HotGlue input/output directories must remain intact for idempotency and dedupe to work:
-
-- `sync-output/` — connector/tap output consumed by the transformation
-- `snapshots/` — historical snapshots used for dedupe and id mapping
-- `etl-output/` — final Singer-formatted records emitted by the transformation
-
-Mapping configuration is tenant-driven and read from `snapshots/tenant-config.json` at runtime. Update this snapshot when mappings change.
-
-## Build, Test, and Development Commands
-Create an isolated environment before editing:
-
-```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-```
-
-Run jobs **from inside `hubspot/`** by exporting the required environment variables:
-
-- `JOB_TYPE`: `write` (to CRM) or `read` (from CRM to DW). Default: `write`.
-- `FLOW`: Flow identifier used for mapping/snapshots. Example: `AJ3x0LMYI`.
-- `CONNECTOR_ID`: `salesforce`, `hubspot`, or `marketo`.
-- `ROOT_DIR`: base for `sync-output/`/`snapshots/`/`etl-output/` (default `.` — another reason the working directory matters).
-
-Examples:
-
-```bash
-cd hubspot
-
-# Write job to Salesforce
-JOB_TYPE=write FLOW=AJ3x0LMYI CONNECTOR_ID=salesforce python etl.py
-
-# Read job from Salesforce
-JOB_TYPE=read FLOW=AJ3x0LMYI CONNECTOR_ID=salesforce python etl.py
-
-# Write job to HubSpot
-JOB_TYPE=write FLOW=AJ3x0LMYI CONNECTOR_ID=hubspot python etl.py
-
-# Read job from HubSpot
-JOB_TYPE=read FLOW=AJ3x0LMYI CONNECTOR_ID=hubspot python etl.py
-```
-
-To replicate a real (e.g. failed) HotGlue job locally — including its exact `sync-output/`, snapshots, and env vars — use the hotglue CLI workflow in `.claude/skills/local-job-debugging/`.
-
-## Coding Style & Naming Conventions
-Follow PEP 8 conventions: four-space indentation, snake_case for functions/variables, and CapWords for classes. Type hints are present in critical paths—add them to new helpers. Reuse the shared logger configured in `etl.py` and prefer descriptive, imperative function names (e.g., `split_contacts_by_account`).
-
-## Testing Guidelines
-A pytest suite exists under `hubspot/tests/` (currently covering `prepare_for_singer` serialization edge cases — NaN/Infinity tokens, container literals). Run it from the repo root:
-
-```bash
-pytest hubspot/tests/
-```
-
-For behavior the suite doesn't cover, use targeted job runs:
-
-1. Run both `write` and `read` jobs against representative `sync-output/` payloads.
-2. Inspect generated Singer files under `etl-output/` and verify schema/values.
-3. Confirm snapshots under `snapshots/` are updated and no unintended deletions occurred.
-4. When changing mapping logic, update `snapshots/tenant-config.json` and prepare minimal input samples in `sync-output/` to demonstrate new behavior.
-
-Additional expectations:
-
-- Salesforce write path may split `contacts` into `Contact` and `Lead` depending on account linkage.
-- HubSpot associations are NOT formatted by this transformation; HubSpot applies its own association rules downstream.
-- All outgoing data is serialized using `prepare_for_singer()` so datetime fields become Singer-friendly ISO strings.
-
-## Write Policy
-
-- Salesforce: `contacts` are always written, split into `Contact` (account-linked) and `Lead` (accountless) by account linkage. `accounts` are written to the Salesforce `Account` object **when the flow has an `accounts/Account` mapping**. Contacts whose account has not yet synced to Salesforce are held back (not written as Leads) so they sync as `Contact`s once the account lands and the `Account` snapshot maps `CBX1-account-id → SF-Account-Id`. Other objects are not written.
-- HubSpot: `contacts` are always written. `accounts` (HubSpot companies object) are written **only when the tenant has a `TenantEgestionMapping` configured for `ACCOUNT → HUBSPOT`** — the presence of an `"accounts"` key in `stream_name_mapping` is the opt-in signal. Other objects are not written.
-
-## Commit & Pull Request Guidelines
-Write brief, imperative commit titles (e.g., "Refactor into connector handlers"). PR descriptions should:
-
-- Summarize the scenario and expected outcomes
-- List files touched and mapping/config changes (especially `snapshots/tenant-config.json`)
-- Call out new/changed environment variables
-- Include before/after snippets or command output demonstrating correct behavior
+- **⚠️ Working directory:** all code and job data live under `hubspot/` (historical name — it hosts ALL connectors including Salesforce and Marketo). Run `etl.py` from inside `hubspot/`; from the repo root it finds no `sync-output/` and produces nothing. Tests run from the repo root: `pytest hubspot/tests/`.
+- **Never delete or bypass `sync-output/`, `snapshots/`, `etl-output/`** — snapshots are the dedupe/idempotency state; blowing one away causes a full re-send to the tenant's CRM.
+- **Respect the Write Policy** (README → Write Policy): streams absent from the flow's mapping are intentionally not written; Salesforce contacts without a synced account are intentionally held back. Neither is a bug.
+- **Don't "generalize" the NaN/Infinity token scrub** in `prepare_for_singer` — matching is exact and case-sensitive on purpose (prod incident: `"NaN"` broke the HubSpot export, `"Nan"` is a valid name). The tests in `hubspot/tests/` encode this.
+- Run `pytest hubspot/tests/` before and after touching `utils.py`/serialization paths.
+- To reproduce a real HotGlue job locally: `.claude/skills/local-job-debugging/`. For mapping/handler development: `.claude/skills/etl-development/`.

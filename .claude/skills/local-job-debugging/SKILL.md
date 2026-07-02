@@ -73,6 +73,6 @@ Iterate on the handler/`utils.py` until the diff is clean (or intentionally diff
 | Diff | Usual cause |
 |---|---|
 | Records missing from your `etl-output` | `drop_sent_records()` deduped them — check `snapshots-reference/` state vs what you expected |
-| Whole stream missing | Write policy: stream not in the flow's `stream_name_mapping` (see `AGENTS.md` → Write Policy), or contacts held back waiting for their account to sync (Salesforce) |
+| Whole stream missing | Write policy: stream not in the flow's `stream_name_mapping` (see `README.md` → Write Policy), or contacts held back waiting for their account to sync (Salesforce) |
 | Field values differ | Mapping change in `snapshots/tenant-config.json` (`hotglue_mapping.mapping.{FLOW}`) between the job and your local reference |
 | Datetime/NaN serialization diffs | `prepare_for_singer()` behavior — see `hubspot/tests/` for the exact rules |

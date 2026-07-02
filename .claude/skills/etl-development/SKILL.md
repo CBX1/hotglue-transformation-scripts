@@ -5,7 +5,7 @@ description: Develop and test the CRM transformation scripts locally — read vs
 
 # ETL Development
 
-Authoritative reference: `AGENTS.md` (structure, write policy, testing guidelines) and `docs/architecture.md` (end-to-end pipeline). This skill is the operational workflow.
+Authoritative reference: `README.md` (structure, write policy, usage, troubleshooting) and `docs/architecture.md` (end-to-end pipeline). This skill is the operational workflow.
 
 **⚠️ Everything runs from `hubspot/`** — code, `sync-output/`, `snapshots/`, `etl-output/` all live there (historical dir name; it hosts ALL connectors). Only pytest runs from the repo root.
 
@@ -54,7 +54,7 @@ To run against a **real job's data** instead of fixtures, use the `local-job-deb
 ## Common gotchas
 
 - Ran from repo root → `sync-output` not found / empty output. `cd hubspot` first.
-- Contacts silently held back (Salesforce): their account hasn't synced yet — by design (see `AGENTS.md` → Write Policy), not a bug.
+- Contacts silently held back (Salesforce): their account hasn't synced yet — by design (see `README.md` → Write Policy), not a bug.
 - Stream "ignored": no `{stream}/{Object}` key in the flow's mapping.
 - Everything re-sent: missing/blown-away snapshot file.
 - `"NaN"` vs `"Nan"`: the token scrub is exact and case-sensitive on purpose (prod incident) — don't "generalize" it.

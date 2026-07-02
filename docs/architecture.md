@@ -1,6 +1,6 @@
 # CBX1 ↔ CRM Sync — End-to-End Architecture
 
-Single authoritative description of how the three HotGlue repos compose. Repo-specific detail lives in each repo's `AGENTS.md`; this doc covers the pipeline as a whole.
+Single authoritative description of how the three HotGlue repos compose. Repo-specific detail lives in each repo's `README.md`; this doc covers the pipeline as a whole.
 
 ## The three repos
 
@@ -71,11 +71,11 @@ All ETL output passes through `prepare_for_singer()` (datetimes → ISO strings;
 
 1. **Which stage failed?** HotGlue job logs show tap, ETL, and target phases separately.
 2. **ETL stage:** replicate the exact job locally with the hotglue CLI (`hotglue etl setup-local-run <job>` then `hotglue etl local-run`) — see `.claude/skills/local-job-debugging/` in this repo.
-3. **Tap stage (CBX1 read):** run `tap-cbx1` locally against QA — see `cbx1-tap-hotglue/AGENTS.md` debugging playbook (auth, keyset pagination, state).
-4. **Target stage (CBX1 write):** feed the job's `etl-output/data.singer` into `target-cbx1` locally against QA — see `cbx1-target-hotglue/AGENTS.md` (lookupKey skips, per-record errors, replayable cURL).
+3. **Tap stage (CBX1 read):** run `tap-cbx1` locally against QA — see `cbx1-tap-hotglue/README.md` debugging playbook (auth, keyset pagination, state).
+4. **Target stage (CBX1 write):** feed the job's `etl-output/data.singer` into `target-cbx1` locally against QA — see `cbx1-target-hotglue/README.md` (lookupKey skips, per-record errors, replayable cURL).
 
 ## Credentials quick reference
 
 - `Code` / `OrgId`: from the tenant's Descope access key for the CBX1 IDM (`api/g/v1/auth/tokens`). Same pair works for tap and target. Ask in #eng-crm-self-serve for QA-tenant credentials.
 - Both tap and target **write the JWT session token back into `config.json`** after auth — never commit a used config file (gitignored in both repos).
-- hotglue CLI auth: `hotglue auth` (browser login) — needed for the local-job-debugging workflow.
+- hotglue CLI auth: `hotglue config set apikey <key>` (Personal API Key from the hotglue dashboard → Account → Login & Security) — needed for the local-job-debugging workflow.

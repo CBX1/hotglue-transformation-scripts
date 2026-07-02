@@ -4,7 +4,7 @@ This repository contains transformation scripts for integrating CBX1 App with CR
 
 > **⚠️ All code lives under `hubspot/`** (historical name — it hosts ALL connectors). Run `etl.py` from inside `hubspot/`, not the repo root.
 >
-> **Agents / detailed guidance:** [`AGENTS.md`](AGENTS.md). **End-to-end pipeline (tap → this ETL → target):** [`docs/architecture.md`](docs/architecture.md).
+> **End-to-end pipeline (tap → this ETL → target):** [`docs/architecture.md`](docs/architecture.md).
 
 ## Overview
 
@@ -68,11 +68,11 @@ The system supports two job types:
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `JOB_TYPE` | Job type: `write` or `read` | `write` |
-| `FLOW` | Flow identifier | `AJ3x0LMYI` |
-| `ROOT_DIR` | Root directory path | `.` |
-| `CONNECTOR_ID` | Connector identifier | `salesforce` |
-| `JOB_ROOT` | S3 root path | - |
+| `JOB_TYPE` | Job type: `write` (CBX1 → CRM) or `read` (CRM → CBX1) | `write` |
+| `FLOW` | Flow identifier used for mapping/snapshots | `AJ3x0LMYI` |
+| `ROOT_DIR` | Base dir for `sync-output/`/`snapshots/`/`etl-output/` | `.` |
+| `CONNECTOR_ID` | `salesforce`, `hubspot`, or `marketo` (required) | — |
+| `JOB_ROOT` | S3 root path of the HotGlue job | — |
 
 ### Tenant Configuration
 
@@ -190,6 +190,11 @@ Returns appropriate contact data based on connector and stream type.
 
 **Returns:** Appropriate DataFrame
 
+## Write Policy
+
+- **Salesforce**: `contacts` are always written, split into `Contact` (account-linked) and `Lead` (accountless) by account linkage. `accounts` are written to the Salesforce `Account` object **when the flow has an `accounts/Account` mapping**. Contacts whose account has not yet synced to Salesforce are held back (not written as Leads) so they sync as `Contact`s once the account lands and the `Account` snapshot maps `CBX1-account-id → SF-Account-Id`. Other objects are not written.
+- **HubSpot**: `contacts` are always written. `accounts` (HubSpot companies object) are written **only when the tenant has a `TenantEgestionMapping` configured for `ACCOUNT → HUBSPOT`** — the presence of an `"accounts"` key in `stream_name_mapping` is the opt-in signal. Other objects are not written.
+
 ## Supported CRM Systems
 
 ### Salesforce
@@ -221,6 +226,16 @@ Returns appropriate contact data based on connector and stream type.
 - **json/os**: Configuration and file handling
 
 ## Usage Examples
+
+### Setup
+
+```bash
+cd hubspot
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+**Important**: the HotGlue directories (`sync-output/`, `snapshots/`, `etl-output/`) must remain intact — idempotency and dedupe depend on them. Mapping configuration is tenant-driven and read from `snapshots/tenant-config.json` at runtime.
 
 ### Running a Write Job
 ```bash
@@ -288,3 +303,13 @@ The script provides detailed logging for:
 3. Review log output for specific error messages
 4. Validate input data format and structure
 5. Ensure proper account-contact relationships
+
+## Contributing
+
+- **Style**: PEP 8 — four-space indentation, snake_case functions/variables, CapWords classes. Add type hints to new helpers (present in critical paths). Reuse the shared logger configured in `etl.py`; prefer descriptive, imperative function names (e.g., `split_contacts_by_account`).
+- **Commits**: brief, imperative titles (e.g., "Refactor into connector handlers").
+- **PRs** should:
+  - Summarize the scenario and expected outcomes
+  - List files touched and mapping/config changes (especially `snapshots/tenant-config.json`)
+  - Call out new/changed environment variables
+  - Include before/after snippets or command output demonstrating correct behavior
