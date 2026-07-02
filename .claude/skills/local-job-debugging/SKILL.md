@@ -16,7 +16,9 @@ npm install -g @hotglue/cli
 hotglue config set apikey <key>     # from hotglue dashboard → Account → Login & Security → Personal API Key
 ```
 
-Project config lives in `hubspot/.hotgluerc` (keys: `env`, `flow`, `tap`; optional `tenant`). Verify with `hotglue config`. Override per-command with flags when debugging a different flow/tenant than the checked-in defaults.
+Project config lives in `hubspot/.hotgluerc` (keys: `env`, `flow`, `tap`; optional `tenant`). Verify with `hotglue config`.
+
+⚠️ **The checked-in `.hotgluerc` defaults to `env: prod.different.ai`** — with no overrides, `jobs list` / `setup-local-run` operate against **production**. When you mean QA/dev, point `env` at `dev.different.ai` (edit `.hotgluerc` locally — don't commit it — or use the CLI's env override) and select the right `--tenant`. Treat anything downloaded from prod as sensitive tenant data.
 
 ## Workflow
 

@@ -43,7 +43,7 @@ The system supports two job types:
 
 ### How a job executes (mental model)
 
-1. `etl.py` loads `snapshots/tenant-config.json` → `hotglue_mapping.mapping.{FLOW}` and derives `stream_name_mapping` from its `target/connector` keys (e.g. `"contacts/Contact"` → contacts maps to SF Contact). **A stream absent from the mapping is not written** — that's the write-policy opt-in signal.
+1. `etl.py` loads `snapshots/tenant-config.json` → `hotglue_mapping.mapping.{FLOW}` and derives `stream_name_mapping` from its `target/connector` keys (e.g. `"contacts/Contact"` for a Salesforce write, `"contacts/contacts"` for a HubSpot read). **A stream absent from the mapping is not written** — that's the write-policy opt-in signal.
 2. The connector handler (`{connector}_handler.py`, subclass of `base_handler.py`) implements `handle_write()` / `handle_read()`.
 3. Write path: `gs.Reader(sync-output)` → `map_stream_data()` (field mapping) → `drop_sent_records()` (dedupe vs `snapshots/{stream}_{FLOW}.snapshot.csv`) → connector-specific logic (e.g. `split_contacts_by_account()` for SF Contact/Lead) → `write_to_singer()` → `etl-output/data.singer`.
 4. Read path: CRM parquet → field normalization → inject `crmSystem`, rename `remote_id`→`crmAssociationId`, set `lookupKey` → Singer output for `cbx1-target-hotglue`.
@@ -108,6 +108,8 @@ Located in `snapshots/tenant-config.json`:
   }
 }
 ```
+
+Mapping keys are `{target_stream}/{connector_stream}` and their shape depends on the connector and direction — the example above is a **Salesforce write** mapping (`Account`/`Contact` objects); the **committed** `tenant-config.json` is a **HubSpot read** mapping (`accounts/companies`, `contacts/contacts`, HubSpot property names). The file also carries a `hotglue_metadata` block (tenant name, `OrgId`) alongside `hotglue_mapping`.
 
 ## Data Processing Features
 
@@ -246,25 +248,28 @@ pip install -r requirements.txt
 
 **Important**: the HotGlue directories (`sync-output/`, `snapshots/`, `etl-output/`) must remain intact — idempotency and dedupe depend on them. Mapping configuration is tenant-driven and read from `snapshots/tenant-config.json` at runtime.
 
-### Running a Write Job
+### Running a Read Job (works out of the box)
 
-`hubspot/sync-output/` ships curated QA parquet fixtures (companies, contacts, owners, lists, …) and `snapshots/` a matching `tenant-config.json` for flow `AJ3x0LMYI`, so a job runs out of the box:
+The committed fixtures are a **HubSpot read** setup: `hubspot/sync-output/` holds HubSpot tap output as parquet (companies, contacts, owners, lists — plus `projects` and `contact_subscription_status`, which no code currently reads), and `snapshots/tenant-config.json` maps `accounts/companies` + `contacts/contacts` for flow `AJ3x0LMYI`. So a HubSpot read job runs with no further setup:
 
-```bash
-cd hubspot
-export JOB_TYPE=write
-export FLOW=AJ3x0LMYI
-export CONNECTOR_ID=salesforce
-python etl.py
-head -3 etl-output/data.singer     # inspect the result
-```
-
-### Running a Read Job
 ```bash
 cd hubspot
 export JOB_TYPE=read
 export FLOW=AJ3x0LMYI
 export CONNECTOR_ID=hubspot
+python etl.py
+head -3 etl-output/data.singer     # inspect the result
+```
+
+### Running a Write Job
+
+A write job needs CBX1-shaped input in `sync-output/` and a write mapping (e.g. `contacts/Contact` for Salesforce) in `tenant-config.json` — the committed fixtures don't include these, so craft inputs or pull a real write job's data (see below):
+
+```bash
+cd hubspot
+export JOB_TYPE=write
+export FLOW=<flow-with-write-mapping>
+export CONNECTOR_ID=salesforce   # or hubspot / marketo
 python etl.py
 ```
 
