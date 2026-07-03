@@ -12,6 +12,7 @@ so this handler does not include association logic.
 import gc
 import logging
 from typing import Dict, List, Optional, Set
+from urllib.parse import quote
 
 import pandas as pd
 import numpy as np
@@ -312,8 +313,14 @@ class HubSpotHandler(BaseETLHandler):
         # Process each email individually to avoid requiring Marketing Enterprise
         # Using individual API calls instead of batch operations
         for email in emails_to_unsubscribe:
-            # Create stream name with email embedded in the path
-            stream_name = f"communication-preferences/v4/statuses/{email}/unsubscribe-all?channel=EMAIL"
+            # Create stream name with email embedded in the path.
+            # URL-encode the email so reserved characters (notably "/", but also
+            # "@", "?", etc.) don't corrupt the request path. Some real-world
+            # addresses contain a "/" (e.g. "nandita/borkakoti@example.co.uk"),
+            # which otherwise injects an extra path segment and makes HubSpot
+            # return a non-JSON body -> "Expecting value: line 1 column 1 (char 0)".
+            encoded_email = quote(str(email), safe="")
+            stream_name = f"communication-preferences/v4/statuses/{encoded_email}/unsubscribe-all?channel=EMAIL"
             
             # Create a DataFrame with a single row but no columns (as per documentation)
             # The email is embedded in the URL path, so no data payload is needed

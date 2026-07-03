@@ -89,9 +89,17 @@ jobs:
         env:
           HOTGLUE_API_KEY: ${{ secrets.HOTGLUE_API_KEY }}
         run: |
-          npx -y @hotglue/cli@1.1.0 etl deploy \
-            --sourceFolder ./hubspot \
-            --env "$HOTGLUE_ENV" \
-            --flow AJ3x0LMYI \
-            --tap hubspot \
-            --apikey "$HOTGLUE_API_KEY"
+          # AJ3x0LMYI is a bidirectional flow. The ETL must be deployed to EACH supported
+          # connector's slot, not just hubspot — otherwise read/write jobs for the other
+          # connectors run whatever was last deployed (stale), which is how Salesforce writes
+          # silently ran old code.
+          for TAP in hubspot salesforce; do
+            echo "::group::Deploy ETL --tap $TAP"
+            npx -y @hotglue/cli@1.1.0 etl deploy \
+              --sourceFolder ./hubspot \
+              --env "$HOTGLUE_ENV" \
+              --flow AJ3x0LMYI \
+              --tap "$TAP" \
+              --apikey "$HOTGLUE_API_KEY"
+            echo "::endgroup::"
+          done
