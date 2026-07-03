@@ -513,7 +513,7 @@ class SalesforceHandler(BaseETLHandler):
         records = df.to_dict(orient="records")
         wrapped = [
             {
-                "data": self._clean_record_for_serialization(rec),
+                "data": {**self._clean_record_for_serialization(rec), "source": source},
                 "sourceRecordId": rec.get(id_col),
                 "source": source,
                 "lookupKey": rec.get(lookup_field),
