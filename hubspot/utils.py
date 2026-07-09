@@ -225,7 +225,11 @@ def _parses_to_python_container(value: object) -> bool:
         return False
 
 
-def _sanitize_singer_value(value: object, counts: Dict[str, int]) -> object:
+def _sanitize_singer_value(
+    value: object,
+    counts: Dict[str, int],
+    neutralize_containers: bool = False,
+) -> object:
     """Recursively sanitize string leaves so the Singer output survives strict,
     ``ast.literal_eval``-based downstream parsers (e.g. hotglue target-hubspot).
 
@@ -237,17 +241,31 @@ def _sanitize_singer_value(value: object, counts: Dict[str, int]) -> object:
     2. Strings ``ast.literal_eval`` would turn into a container ("1,316" ->
        ``(1, 316)``, "298," -> ``(298,)``). A comma-formatted integer (grouping
        and/or trailing comma) has its separators removed so it round-trips as
-       the intended scalar ("1,316" -> "1316", "298," -> "298"). Any *other*
-       container literal (e.g. the ambiguous European decimal "12,34", or
-       "[1, 2]") has no safe, connector-agnostic rewrite — stripping commas
-       would corrupt a decimal, and ``repr()``-wrapping would inject literal
-       quotes for non-literal_eval consumers like the CBX1 read path — so it is
-       left UNCHANGED and only flagged. A loud, isolated downstream failure is
-       preferable to silently dropping or corrupting data.
+       the intended scalar ("1,316" -> "1316", "298," -> "298").
 
-    Only values that are safely repairable are altered — every other string
-    passes through untouched. Walks nested dicts/lists. ``counts`` accumulates
-    per-reason tallies for logging.
+    Any *other* container literal (the ambiguous European decimal "12,34",
+    coordinate-like "120, -6", "[1, 2]", …) has no unambiguous numeric rewrite.
+    Its handling depends on the downstream target:
+
+    - ``neutralize_containers=True`` (the CBX1 -> CRM *write* direction, whose
+      target reads via ``ast.literal_eval``/``gluestick.parse_objs``): emit
+      ``repr(value)``. The downstream ``ast.literal_eval`` then reconstructs the
+      ORIGINAL string rather than a tuple/list — ``ast.literal_eval(repr(s)) ==
+      s`` for any ``str``, so it is lossless (e.g. "120, -6" is delivered as the
+      scalar string "120, -6", not the array ``[120, -6]``). This ends the
+      per-value-shape whack-a-mole (NaN #29, grouped-number #32, trailing-comma
+      #34, …): ANY container-parseable string now round-trips as a scalar.
+    - ``neutralize_containers=False`` (the default; the CRM -> CBX1 *read*
+      direction, whose ``cbx1-target`` does NOT ``ast.literal_eval``): leave the
+      value UNCHANGED and only flag it — ``repr()``-wrapping here would inject
+      literal quotes into the CBX1 payload, and there is no crash to avoid on
+      this path (a container-parseable string reaches the CBX1 backend as a
+      plain string). A loud, isolated downstream failure is preferable to
+      silently corrupting data.
+
+    Only values that are safely repairable/neutralizable are altered — every
+    other string passes through untouched. Walks nested dicts/lists. ``counts``
+    accumulates per-reason tallies for logging.
     """
     if isinstance(value, str):
         if _spells_nonfinite_float(value):
@@ -258,17 +276,26 @@ def _sanitize_singer_value(value: object, counts: Dict[str, int]) -> object:
             if repaired is not None:
                 counts["comma_number"] = counts.get("comma_number", 0) + 1
                 return repaired
+            if neutralize_containers:
+                counts["neutralized_container"] = counts.get("neutralized_container", 0) + 1
+                return repr(value)
             counts["flagged_container"] = counts.get("flagged_container", 0) + 1
             return value
         return value
     if isinstance(value, dict):
-        return {k: _sanitize_singer_value(v, counts) for k, v in value.items()}
+        return {
+            k: _sanitize_singer_value(v, counts, neutralize_containers)
+            for k, v in value.items()
+        }
     if isinstance(value, list):
-        return [_sanitize_singer_value(v, counts) for v in value]
+        return [_sanitize_singer_value(v, counts, neutralize_containers) for v in value]
     return value
 
 
-def prepare_for_singer(df: Optional[pd.DataFrame]) -> pd.DataFrame:
+def prepare_for_singer(
+    df: Optional[pd.DataFrame],
+    neutralize_containers: bool = False,
+) -> pd.DataFrame:
     """
     Prepare DataFrame for Singer format output.
 
@@ -286,6 +313,15 @@ def prepare_for_singer(df: Optional[pd.DataFrame]) -> pd.DataFrame:
 
     Args:
         df: DataFrame to prepare for Singer output
+        neutralize_containers: When True (the CBX1 -> CRM *write* direction,
+            whose target unstringifies values with ``ast.literal_eval``), any
+            container-parseable string with no numeric rewrite is emitted as
+            ``repr(value)`` so the downstream reconstructs the original scalar
+            string instead of an array/object. When False (the default; the
+            CRM -> CBX1 *read* direction feeding ``cbx1-target``, which does not
+            ``ast.literal_eval``), such strings are left unchanged and flagged —
+            ``repr()`` there would leak literal quotes into CBX1. Callers pass
+            ``JOB_TYPE == "write"``. See ``_sanitize_singer_value``.
 
     Returns:
         DataFrame with datetime columns converted to Singer-compatible strings
@@ -319,11 +355,14 @@ def prepare_for_singer(df: Optional[pd.DataFrame]) -> pd.DataFrame:
     # See _sanitize_singer_value for the rules.
     counts: Dict[str, int] = {}
     touched_cols: List[str] = []
-    _CHANGED = ("nonfinite", "comma_number")  # reasons that mutate the value
+    # Reasons that mutate the value (so the scrubbed column must be written back).
+    _CHANGED = ("nonfinite", "comma_number", "neutralized_container")
     string_cols = prepared_df.select_dtypes(include=["object", "string"]).columns
     for col in string_cols:
         before = sum(counts.get(k, 0) for k in _CHANGED)
-        scrubbed = prepared_df[col].map(lambda v: _sanitize_singer_value(v, counts))
+        scrubbed = prepared_df[col].map(
+            lambda v: _sanitize_singer_value(v, counts, neutralize_containers)
+        )
         if sum(counts.get(k, 0) for k in _CHANGED) > before:
             prepared_df[col] = scrubbed
             touched_cols.append(col)
@@ -332,10 +371,11 @@ def prepare_for_singer(df: Optional[pd.DataFrame]) -> pd.DataFrame:
         logger.warning(
             "prepare_for_singer: sanitized %d malformed string value(s) for downstream "
             "JSON safety (changed columns: %s; reasons: %s). %d container-literal(s) "
-            "left as-is and may fail strict scalar targets.",
+            "neutralized via repr(); %d left as-is and may fail strict scalar targets.",
             sum(counts.get(k, 0) for k in _CHANGED),
             touched_cols,
             counts,
+            counts.get("neutralized_container", 0),
             counts.get("flagged_container", 0),
         )
 
