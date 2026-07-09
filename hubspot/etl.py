@@ -259,7 +259,13 @@ def main() -> None:
     except ValueError as e:
         logger.error(f"Failed to initialize handler: {e}")
         raise
-    
+
+    # On the write direction (CBX1 -> CRM) the downstream target reads values
+    # with ast.literal_eval (gluestick.parse_objs), so container-parseable
+    # strings must be repr()-wrapped to survive as scalars. The read direction
+    # (CRM -> CBX1) feeds cbx1-target, which does not — leave it False there.
+    handler.neutralize_container_literals = (job_type == "write")
+
     # Execute the appropriate operation
     try:
         if job_type == "write":

@@ -18,6 +18,7 @@ Run standalone:  python hubspot/tests/test_prepare_for_singer_container_literals
 Run via pytest:  pytest hubspot/tests/test_prepare_for_singer_container_literals.py
 """
 
+import ast
 import os
 import sys
 
@@ -115,6 +116,81 @@ def test_does_not_mutate_input():
     df = pd.DataFrame([{"zip": "1,316"}])
     prepare_for_singer(df)
     assert df["zip"].iloc[0] == "1,316"  # original untouched (df.copy())
+
+
+# --- Write direction (CBX1 -> CRM): neutralize_containers=True ---------------
+# The CRM target (target-hubspot/-salesforce/-marketo) unstringifies values with
+# ast.literal_eval, so a container-parseable string with no numeric rewrite is
+# emitted as repr(value) and reconstructed downstream as the ORIGINAL scalar
+# string. Regression for the thoughtspot jobtitle="120, -6" EXPORT_FAILED
+# (ast.literal_eval("120, -6") -> (120, -6) -> JSON array [120, -6]).
+
+
+def test_write_neutralizes_coordinate_like_jobtitle():
+    # The production record: jobtitle "120, -6" -> would arrayify -> HubSpot 400.
+    row = {"email": "ianbak@gmail.com", "firstname": "Ioannis", "jobtitle": "120, -6"}
+    out = prepare_for_singer(
+        pd.DataFrame([row]), neutralize_containers=True
+    ).to_dict(orient="records")[0]
+    # Emitted value round-trips through the downstream ast.literal_eval back to
+    # the original scalar string (never an array/tuple).
+    assert ast.literal_eval(out["jobtitle"]) == "120, -6"
+    assert not isinstance(ast.literal_eval(out["jobtitle"]), (tuple, list, dict, set))
+    assert out["firstname"] == "Ioannis"  # untouched
+
+
+def test_write_neutralizes_all_container_shapes_losslessly():
+    df = pd.DataFrame([{
+        "coord": "120, -6",     # tuple of ints
+        "euro": "12,34",        # ambiguous decimal (no numeric rewrite)
+        "list": "[1, 2, 3]",    # list literal
+        "tuple": "(1, 2)",      # tuple literal
+        "dict": "{'a': 1}",     # dict literal
+        "seq": "1, 2, 3",       # bare tuple
+    }])
+    out = prepare_for_singer(df, neutralize_containers=True).to_dict(orient="records")[0]
+    for col, original in {
+        "coord": "120, -6", "euro": "12,34", "list": "[1, 2, 3]",
+        "tuple": "(1, 2)", "dict": "{'a': 1}", "seq": "1, 2, 3",
+    }.items():
+        # ast.literal_eval(repr(s)) == s -> downstream reconstructs the string.
+        assert ast.literal_eval(out[col]) == original, col
+
+
+def test_write_still_repairs_comma_numbers_not_repr():
+    # Numeric repair takes precedence over repr-wrap: a grouped number stays the
+    # clean scalar "1316", not "'1,316'".
+    out = prepare_for_singer(
+        pd.DataFrame([{"zip": "1,316", "address": "298,"}]), neutralize_containers=True
+    ).to_dict(orient="records")[0]
+    assert out["zip"] == "1316"
+    assert out["address"] == "298"
+
+
+def test_write_still_leaves_plain_text_and_scalars_untouched():
+    # Only values ast.literal_eval turns into a container are altered; ordinary
+    # comma text and plain numeric strings pass through even on the write path.
+    out = prepare_for_singer(
+        pd.DataFrame([{
+            "name": "Smith, John",   # literal_eval fails -> untouched
+            "title": "Engineer",     # untouched
+            "zip": "94538",          # plain numeric string -> untouched
+        }]),
+        neutralize_containers=True,
+    ).to_dict(orient="records")[0]
+    assert out["name"] == "Smith, John"
+    assert out["title"] == "Engineer"
+    assert out["zip"] == "94538"
+
+
+def test_read_default_leaves_container_unchanged_not_repr():
+    # Direction asymmetry: the read path (default, cbx1-target does not
+    # ast.literal_eval) must leave "120, -6" byte-for-byte, NOT repr-wrap it
+    # (repr quotes would leak into the CBX1 payload).
+    out = prepare_for_singer(
+        pd.DataFrame([{"jobtitle": "120, -6"}])
+    ).to_dict(orient="records")[0]
+    assert out["jobtitle"] == "120, -6"
 
 
 if __name__ == "__main__":
