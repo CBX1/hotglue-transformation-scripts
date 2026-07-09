@@ -69,7 +69,13 @@ class BaseETLHandler(ABC):
         self.input_dir = input_dir
         self.snapshot_dir = snapshot_dir
         self.output_dir = output_dir
-        
+        # Set by the entrypoint (etl.py) to JOB_TYPE == "write": on the CBX1 ->
+        # CRM write direction the downstream target unstringifies values with
+        # ast.literal_eval, so container-parseable strings must be repr()-wrapped
+        # (see utils.prepare_for_singer). Defaults False (CRM -> CBX1 read
+        # direction, whose cbx1-target does not ast.literal_eval).
+        self.neutralize_container_literals = False
+
     @abstractmethod
     def handle_write(self) -> None:
         """
@@ -152,8 +158,10 @@ class BaseETLHandler(ABC):
         if df is None or df.empty:
             logger.info(f"No data to write for stream: {stream_name}")
             return
-            
-        output_df = prepare_for_singer(df)
+
+        output_df = prepare_for_singer(
+            df, neutralize_containers=self.neutralize_container_literals
+        )
         gs.to_singer(
             output_df,
             stream_name,
