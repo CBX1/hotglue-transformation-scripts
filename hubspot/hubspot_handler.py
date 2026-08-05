@@ -10,8 +10,9 @@ so this handler does not include association logic.
 """
 
 import gc
+import json
 import logging
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import quote
 
 import pandas as pd
@@ -68,6 +69,24 @@ class HubSpotHandler(BaseETLHandler):
         "hs_object_id",
         "updatedAt",
         "pendingCriticalFieldsForCrmSync",
+    }
+
+    # CRM -> CBX1 read order. Explicit and ordered on purpose: list_available_streams()
+    # sorts alphabetically, which puts the associations_* edges AHEAD of the companies,
+    # contacts and deals they reference, so every link would ingest with an unresolved
+    # accountId / contactId / dealId. Filtering a set here instead of iterating this
+    # tuple silently reintroduces that bug.
+    READ_STREAM_ORDER: Tuple[str, ...] = (
+        "companies",
+        "contacts",
+        "deals",
+        "associations_deals_companies",
+        "associations_deals_contacts",
+    )
+
+    ASSOCIATION_STREAMS: Set[str] = {
+        "associations_deals_companies",
+        "associations_deals_contacts",
     }
 
     # Columns required by _handle_global_unsubscribe — kept here so both the caller
@@ -457,10 +476,13 @@ class HubSpotHandler(BaseETLHandler):
         """
         Handle the read operation for HubSpot data.
 
-        Processes contacts and companies in fixed-size chunks (READ_CHUNK_SIZE rows)
-        read directly from the Singer input file. Each chunk is enriched and written
-        to the Singer output file in append mode, so peak memory is bounded to one
-        chunk regardless of total dataset size.
+        Processes the READ_STREAM_ORDER streams in fixed-size chunks (READ_CHUNK_SIZE
+        rows) read directly from the Singer input file. Each chunk is enriched and
+        written to the Singer output file in append mode, so peak memory is bounded to
+        one chunk regardless of total dataset size.
+
+        Streams are emitted in dependency order so the backend can resolve every
+        reference on the first pass — see READ_STREAM_ORDER.
 
         Shared lookup tables (owners, lists) are built once and reused across chunks.
         An explicit gc.collect() is called between streams to release memory before
@@ -479,7 +501,8 @@ class HubSpotHandler(BaseETLHandler):
         account_lookup = self._prepare_account_lookup()
 
         inverse_mapping = {v: k for k, v in self.stream_name_mapping.items()}
-        target_streams = [s for s in data_streams if s in {"contacts", "companies"}]
+        target_streams = [s for s in self.READ_STREAM_ORDER if s in data_streams]
+        logger.info("HubSpot read order: %s", target_streams)
 
         for stream in target_streams:
             logger.info("Processing read stream (chunked): %s", stream)
@@ -488,15 +511,24 @@ class HubSpotHandler(BaseETLHandler):
             total_written = 0
 
             for chunk_df in iter_stream_chunks(self.input_dir, stream):
-                chunk_df = self._filter_archived_records(chunk_df, stream)
+                # Deals keep their archived rows: `archived` is mirrored to isDeleted so
+                # a deleted deal is visible downstream. Dropping the row would leave the
+                # previously-synced deal looking live forever.
+                if stream != "deals":
+                    chunk_df = self._filter_archived_records(chunk_df, stream)
                 if chunk_df is None or chunk_df.empty:
                     continue
 
-                chunk_df, owner_column = self._apply_read_mapping(chunk_df, stream)
-                if stream == "contacts":
-                    chunk_df = self._resolve_contact_account_ids(chunk_df, account_lookup)
-                chunk_df = self._merge_owner_details(chunk_df, owner_lookup, owner_column)
-                chunk_df = self._populate_list_memberships(chunk_df, stream, list_lookup)
+                if stream in self.ASSOCIATION_STREAMS:
+                    chunk_df = self._build_association_lookup_key(chunk_df)
+                    chunk_df = self._derive_association_flags(chunk_df)
+                else:
+                    chunk_df, owner_column = self._apply_read_mapping(chunk_df, stream)
+                    if stream == "contacts":
+                        chunk_df = self._resolve_contact_account_ids(chunk_df, account_lookup)
+                    chunk_df = self._merge_owner_details(chunk_df, owner_lookup, owner_column)
+                    if stream in {"contacts", "companies"}:
+                        chunk_df = self._populate_list_memberships(chunk_df, stream, list_lookup)
                 chunk_df = self._wrap_records_with_metadata(chunk_df, stream)
 
                 if chunk_df is None or chunk_df.empty:
@@ -510,6 +542,107 @@ class HubSpotHandler(BaseETLHandler):
 
             logger.info("Wrote %d records for read stream: %s", total_written, stream)
             gc.collect()
+
+    @staticmethod
+    def _parse_association_types(raw) -> List[Dict]:
+        """
+        Decode an `associationTypes` cell, which HubSpot delivers as a JSON *string*
+        rather than a nested object.
+
+        Returns [] for anything unusable so the caller yields default flags instead of
+        failing the whole chunk — one malformed edge must not drop a tenant's sync.
+        """
+        if isinstance(raw, list):
+            return raw
+        if not isinstance(raw, str) or not raw.strip():
+            return []
+        try:
+            parsed = json.loads(raw)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            logger.warning(
+                "Unparseable associationTypes; defaulting isPrimary=False, roleLabel=None"
+            )
+            return []
+        return parsed if isinstance(parsed, list) else []
+
+    def _build_association_lookup_key(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Set `lookupKey` = "{from_id}:{to_id}" on an association chunk.
+
+        An association edge has no object id of its own, and cbx1-target skips any
+        record whose lookupKey is null — so without this every edge is dropped
+        silently before the API call. A null on either side yields a null key, which
+        is the correct outcome: an edge missing one endpoint is not ingestable.
+        """
+        if df is None or df.empty:
+            return df
+
+        missing = [col for col in ("from_id", "to_id") if col not in df.columns]
+        if missing:
+            logger.warning("Association chunk missing %s; lookupKey left unset", missing)
+            return df
+
+        df["lookupKey"] = (
+            df["from_id"].astype("string").str.strip()
+            + ":"
+            + df["to_id"].astype("string").str.strip()
+        )
+        return df
+
+    def _derive_association_flags(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Derive `isPrimary` and `roleLabel` from the nested `associationTypes` list.
+
+        Both signals live *inside* associationTypes, never in the top-level
+        typeId/label — those mirror associationTypes[0], the base HUBSPOT_DEFINED
+        type, whose label is always null. Reading the top-level label would mark every
+        edge non-primary and silently break account roll-up.
+
+        Rules:
+          isPrimary — any entry labelled "Primary"
+          roleLabel — the label of the first USER_DEFINED entry
+
+        Keyed on category + label rather than the numeric typeId, so the rule does not
+        depend on HubSpot's type ids being identical across portals.
+        """
+        if df is None or df.empty:
+            return df
+
+        if "associationTypes" not in df.columns:
+            logger.warning("Association chunk has no associationTypes column; flags defaulted")
+            df["isPrimary"] = False
+            df["roleLabel"] = None
+            return df
+
+        parsed = df["associationTypes"].apply(self._parse_association_types)
+
+        df["isPrimary"] = parsed.apply(
+            lambda types: any(
+                isinstance(entry, dict)
+                and str(entry.get("label") or "").strip().lower() == "primary"
+                for entry in types
+            )
+        )
+        df["roleLabel"] = parsed.apply(
+            lambda types: next(
+                (
+                    entry.get("label")
+                    for entry in types
+                    if isinstance(entry, dict)
+                    and entry.get("category") == "USER_DEFINED"
+                    and entry.get("label")
+                ),
+                None,
+            )
+        )
+
+        logger.info(
+            "Derived association flags for %d edges: %d primary, %d with a role label",
+            len(df),
+            int(df["isPrimary"].sum()),
+            int(df["roleLabel"].notna().sum()),
+        )
+        return df
 
     def _prepare_owner_lookup(self, streams: List[str]) -> Optional[pd.DataFrame]:
         """
@@ -822,11 +955,17 @@ class HubSpotHandler(BaseETLHandler):
         if df is None or df.empty:
             return df
 
-        # Determine lookup key field based on stream
+        # Determine the lookup key and the source-record id per stream. They differ for
+        # deals (the HubSpot id is itself the business key) and for association edges,
+        # which have no object id at all — E1's composite is their only identity.
         if stream == "contacts":
-            lookup_field = "email"
+            lookup_field, id_field = "email", "id"
         elif stream == "companies":
-            lookup_field = "domain"
+            lookup_field, id_field = "domain", "id"
+        elif stream == "deals":
+            lookup_field, id_field = "id", "id"
+        elif stream in self.ASSOCIATION_STREAMS:
+            lookup_field, id_field = "lookupKey", "lookupKey"
         else:
             logger.warning(f"Unknown stream '{stream}' for record wrapping")
             return pd.DataFrame(columns=["data", "sourceRecordId", "source", "lookupKey"])
@@ -835,8 +974,8 @@ class HubSpotHandler(BaseETLHandler):
         # handle_read skips the chunk without emitting an unwrapped SCHEMA that would poison
         # all subsequent correctly-wrapped chunks.
         _WRAPPED_COLS = ["data", "sourceRecordId", "source", "lookupKey"]
-        if "id" not in df.columns:
-            logger.warning(f"Missing 'id' field in {stream}, skipping chunk")
+        if id_field not in df.columns:
+            logger.warning(f"Missing '{id_field}' field in {stream}, skipping chunk")
             return pd.DataFrame(columns=_WRAPPED_COLS)
 
         if lookup_field not in df.columns:
@@ -871,7 +1010,7 @@ class HubSpotHandler(BaseETLHandler):
 
             wrapped = {
                 "data": cleaned_record,
-                "sourceRecordId": record.get("id"),
+                "sourceRecordId": record.get(id_field),
                 "source": "HUBSPOT",
                 "lookupKey": record.get(lookup_field)
             }

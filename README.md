@@ -201,6 +201,30 @@ Returns appropriate contact data based on connector and stream type.
 
 **Returns:** Appropriate DataFrame
 
+## Read Policy (HubSpot)
+
+Read streams are processed in an **explicit dependency order**, not alphabetically:
+
+```
+companies → contacts → deals → associations_deals_companies → associations_deals_contacts
+```
+
+Endpoints are emitted before the edges that reference them, so the CBX1 backend resolves every `accountId` / `contactId` / `dealId` on the first pass. The order is defined by `HubSpotHandler.READ_STREAM_ORDER` and preserved downstream by `cbx1-target-hotglue` (its active sinks are an `OrderedDict` drained at parallelism 1).
+
+⚠️ **Do not turn `READ_STREAM_ORDER` back into a set filtered from `list_available_streams()`** — that sorts alphabetically, which puts `associations_*` first and leaves every link ingested unresolved. `hubspot/tests/test_deal_association_streams.py` guards this.
+
+Two derivations run on the association streams only, because the source shape can't be expressed as a field mapping:
+
+| Field | Rule |
+|---|---|
+| `lookupKey` | `"{from_id}:{to_id}"` — an edge has no object id, and the CBX1 target skips records with a null `lookupKey` |
+| `isPrimary` | any entry in `associationTypes` labelled `"Primary"` |
+| `roleLabel` | the `label` of the first `USER_DEFINED` entry in `associationTypes` |
+
+`associationTypes` arrives as a JSON-encoded **string**, and both signals live inside it — the top-level `typeId`/`label` mirror `associationTypes[0]` (the base `HUBSPOT_DEFINED` type, label always null), so reading them marks every edge non-primary. The rules key on `category` + `label` rather than the numeric `typeId`, which is not guaranteed stable across portals.
+
+Deals also **keep their archived rows** (unlike contacts/companies): `archived` is mirrored to `isDeleted` downstream, so dropping the row would leave a deleted deal looking live forever.
+
 ## Write Policy
 
 - **Salesforce**: `contacts` are always written, split into `Contact` (account-linked) and `Lead` (accountless) by account linkage. `accounts` are written to the Salesforce `Account` object **when the flow has an `accounts/Account` mapping**. Contacts whose account has not yet synced to Salesforce are held back (not written as Leads) so they sync as `Contact`s once the account lands and the `Account` snapshot maps `CBX1-account-id → SF-Account-Id`. Other objects are not written.

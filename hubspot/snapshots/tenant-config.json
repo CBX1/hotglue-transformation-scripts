@@ -1,1 +1,117 @@
-{"hotglue_metadata": {"metadata": {"Name": "Hotglue - HubSpot", "OrgId": "f71fd28f-74db-40cb-8abf-07f5eb329fc2"}}, "hotglue_mapping": {"mapping": {"AJ3x0LMYI": {"accounts/companies": {"knownSince": "createdate", "hqLocation.buildingOrStreet": "address", "annualRevenue": "annualrevenue", "hqLocation.city": "city", "hqLocation.country": "country", "summary": "description", "domain": "website", "facebookUrl": "facebook_company_page", "foundingYear": "founded_year", "additionalDomains": "hs_additional_domains", "hqLocation.countryCode": "hs_country_code", "employeeRange": "hs_employee_range", "linkedinUrl": "linkedin_company_page", "logoUrl": "hs_logo_url", "annualRevenueRange": "hs_revenue_range", "targetAccountTier": "hs_target_account", "cumulativeAccountScore": "hubspotscore", "crmAssociationId": "id", "industry": "industry", "lifecyclestage": "lifecyclestage", "name": "name", "testCRMSync": "name", "employeeCount": "numberofemployees", "totalFunding": "total_money_raised", "twitterUrl": "twitterhandle", "accountType": "type", "techStack": "web_technologies", "hqLocation.zipCode": "zip"}, "contacts/contacts": {"knownSince": "createdate", "lastActivityDate": "notes_last_updated", "lastEngagementDate": "hs_last_sales_activity_timestamp", "lastContactedDate": "notes_last_contacted", "lastWebsiteVisit": "hs_latest_source_timestamp", "lastEmailClick": "hs_email_last_click_date", "address.buildingOrStreet": "address", "address.city": "city", "companyName": "company", "address.country": "country", "email": "email", "crmAttribute": "firstname", "globalUnsubscribe": "hs_email_optout", "leadStatus": "hs_lead_status", "linkedinUrl": "hs_linkedin_url", "managementLevel": "seniority", "cumulativeLeadScore": "hubspotscore", "department": "job_function", "title": "jobtitle", "lastName": "lastname", "lifecyclestage": "lifecyclestage", "phone": "phone", "salutation": "salutation", "address.state": "state", "domain": "website", "address.zipCode": "zip", "crmAssociationId": "id"}}}}}
+{
+  "hotglue_metadata": {
+    "metadata": {
+      "Name": "Hotglue - HubSpot",
+      "OrgId": "f71fd28f-74db-40cb-8abf-07f5eb329fc2"
+    }
+  },
+  "hotglue_mapping": {
+    "mapping": {
+      "AJ3x0LMYI": {
+        "accounts/companies": {
+          "knownSince": "createdate",
+          "hqLocation.buildingOrStreet": "address",
+          "annualRevenue": "annualrevenue",
+          "hqLocation.city": "city",
+          "hqLocation.country": "country",
+          "summary": "description",
+          "domain": "website",
+          "facebookUrl": "facebook_company_page",
+          "foundingYear": "founded_year",
+          "additionalDomains": "hs_additional_domains",
+          "hqLocation.countryCode": "hs_country_code",
+          "employeeRange": "hs_employee_range",
+          "linkedinUrl": "linkedin_company_page",
+          "logoUrl": "hs_logo_url",
+          "annualRevenueRange": "hs_revenue_range",
+          "targetAccountTier": "hs_target_account",
+          "cumulativeAccountScore": "hubspotscore",
+          "crmAssociationId": "id",
+          "industry": "industry",
+          "lifecyclestage": "lifecyclestage",
+          "name": "name",
+          "testCRMSync": "name",
+          "employeeCount": "numberofemployees",
+          "totalFunding": "total_money_raised",
+          "twitterUrl": "twitterhandle",
+          "accountType": "type",
+          "techStack": "web_technologies",
+          "hqLocation.zipCode": "zip"
+        },
+        "contacts/contacts": {
+          "knownSince": "createdate",
+          "lastActivityDate": "notes_last_updated",
+          "lastEngagementDate": "hs_last_sales_activity_timestamp",
+          "lastContactedDate": "notes_last_contacted",
+          "lastWebsiteVisit": "hs_latest_source_timestamp",
+          "lastEmailClick": "hs_email_last_click_date",
+          "address.buildingOrStreet": "address",
+          "address.city": "city",
+          "companyName": "company",
+          "address.country": "country",
+          "email": "email",
+          "crmAttribute": "firstname",
+          "globalUnsubscribe": "hs_email_optout",
+          "leadStatus": "hs_lead_status",
+          "linkedinUrl": "hs_linkedin_url",
+          "managementLevel": "seniority",
+          "cumulativeLeadScore": "hubspotscore",
+          "department": "job_function",
+          "title": "jobtitle",
+          "lastName": "lastname",
+          "lifecyclestage": "lifecyclestage",
+          "phone": "phone",
+          "salutation": "salutation",
+          "address.state": "state",
+          "domain": "website",
+          "address.zipCode": "zip",
+          "crmAssociationId": "id"
+        },
+        "deals/deals": {
+          "crmAssociationId": "id",
+          "name": "dealname",
+          "amount": "amount",
+          "amountBase": "amount_in_home_currency",
+          "currency": "deal_currency_code",
+          "ownerRef": "hubspot_owner_id",
+          "sourceCreatedAt": "createdate",
+          "sourceClosedAt": "closedate",
+          "dataUpdatedAt": "hs_lastmodifieddate",
+          "isClosed": "hs_is_closed",
+          "isWon": "hs_is_closed_won",
+          "isLost": "hs_is_closed_lost",
+          "sourceStage": "dealstage",
+          "sourcePipeline": "pipeline",
+          "dealType": "dealtype",
+          "closedWonReason": "closed_won_reason",
+          "closedLostReason": "closed_lost_reason",
+          "sourcePrimaryCompanyId": "hs_primary_associated_company",
+          "sourceContactCount": "num_associated_contacts",
+          "sourceOrigin": "hs_object_source",
+          "isImported": "hs_was_imported",
+          "isDeleted": "archived"
+        },
+        "deal_company_links/associations_deals_companies": {
+          "lookupKey": "lookupKey",
+          "sourceDealId": "from_id",
+          "sourceCompanyId": "to_id",
+          "isPrimary": "isPrimary",
+          "roleLabel": "roleLabel",
+          "sourceTypeId": "typeId",
+          "sourceLabel": "label",
+          "sourceAssociationTypes": "associationTypes"
+        },
+        "deal_contact_links/associations_deals_contacts": {
+          "lookupKey": "lookupKey",
+          "sourceDealId": "from_id",
+          "sourceContactId": "to_id",
+          "roleLabel": "roleLabel",
+          "isPrimary": "isPrimary",
+          "sourceTypeId": "typeId",
+          "sourceLabel": "label",
+          "sourceAssociationTypes": "associationTypes"
+        }
+      }
+    }
+  }
+}
