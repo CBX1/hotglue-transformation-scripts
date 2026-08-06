@@ -601,28 +601,45 @@ class HubSpotHandler(BaseETLHandler):
         self, df: pd.DataFrame, account_lookup: Optional[Dict[str, str]]
     ) -> pd.DataFrame:
         """
-        Translate `associatedcompanyid` (HubSpot company id) to `accountId` (CBX1 UUID).
+        Resolve `associatedcompanyid` (HubSpot company id) to `accountId` (CBX1 UUID)
+        and pass through the raw id as `associatedCompanyId` so the backend can resolve
+        by crmAssociationId when the snapshot misses.
 
-        Sets accountId=None for contacts whose associatedcompanyid is missing or absent
-        from the snapshot — the backend's own fallback (companyName/domain/email-domain)
-        can still kick in downstream. associatedcompanyid is dropped after translation
-        so the wrapped Singer payload does not leak the raw HubSpot id.
+        When the snapshot resolves, `accountId` is set to the CBX1 UUID. When it does
+        not (company just created, snapshot stale), `accountId` is omitted — NOT set to
+        None — so the backend's existing account link is preserved. The raw HubSpot id
+        is always forwarded as `associatedCompanyId` for backend-side resolution.
         """
         if df is None or df.empty:
             return df
 
-        if "associatedcompanyid" not in df.columns or not account_lookup:
-            df["accountId"] = None
+        has_association = "associatedcompanyid" in df.columns
+
+        if has_association:
+            company_ids = df["associatedcompanyid"].astype("string")
+            df["associatedCompanyId"] = company_ids.where(company_ids.notna())
+        else:
+            df["associatedCompanyId"] = None
+
+        if not has_association or not account_lookup:
+            pass
         else:
             company_ids = df["associatedcompanyid"].astype("string")
-            df["accountId"] = company_ids.map(account_lookup).where(
-                company_ids.notna() & company_ids.isin(account_lookup), None
+            resolved = company_ids.map(account_lookup).where(
+                company_ids.notna() & company_ids.isin(account_lookup)
             )
+            df.loc[resolved.notna(), "accountId"] = resolved[resolved.notna()]
 
         df = df.drop(columns=["associatedcompanyid"], errors="ignore")
 
-        resolved = df["accountId"].notna().sum() if "accountId" in df.columns else 0
-        logger.info("Resolved accountId for %d/%d contacts in chunk", resolved, len(df))
+        resolved_count = df["accountId"].notna().sum() if "accountId" in df.columns else 0
+        total = len(df)
+        forwarded = df["associatedCompanyId"].notna().sum()
+        logger.info(
+            "Resolved accountId for %d/%d contacts in chunk; "
+            "forwarding associatedCompanyId for %d",
+            resolved_count, total, forwarded,
+        )
         return df
 
     def _prepare_list_lookup(self, streams: List[str]) -> Optional[Dict[str, str]]:
@@ -778,7 +795,8 @@ class HubSpotHandler(BaseETLHandler):
             df["hubspot_owner_id"] = None
 
         # Ensure associatedcompanyid exists on contacts; _resolve_contact_account_ids
-        # consumes it to derive accountId and drops it before wrapping.
+        # translates it to accountId (when possible) and passes the raw id through
+        # as associatedCompanyId for backend-side crmAssociationId resolution.
         if stream == "contacts":
             if "associatedcompanyid" not in df.columns:
                 df["associatedcompanyid"] = None
