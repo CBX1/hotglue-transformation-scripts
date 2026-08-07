@@ -18,6 +18,7 @@ Run via pytest:  pytest hubspot/tests/test_deal_association_streams.py
 import os
 import sys
 
+import numpy as np
 import pandas as pd
 
 # Make the connector modules (hubspot_handler.py lives at hubspot/) importable whether
@@ -192,6 +193,52 @@ def test_archived_deals_survive_wrapping():
     wrapped = _handler()._wrap_records_with_metadata(pd.DataFrame([deal]), "deals")
     assert len(wrapped) == 1
     assert wrapped.iloc[0]["data"]["archived"] is True
+
+
+def test_deals_are_in_the_list_membership_gate():
+    # Deal inherits crmListMembershipDetails from BaseTargetEntity on the backend, same as
+    # AccountV2/ContactV2 — leaving deals out of this set would silently keep the field null.
+    assert HubSpotHandler.LIST_MEMBERSHIP_STREAMS == {"contacts", "companies", "deals"}
+
+
+def test_deal_list_memberships_resolve_to_names():
+    deal = {
+        "id": "339564136164",
+        "dealname": "vinay_bss",
+        "_hg_list_memberships": ["101", "202"],
+    }
+    list_lookup = {"101": "Enterprise Pipeline", "202": "Q3 Renewals"}
+
+    result = _handler()._populate_list_memberships(pd.DataFrame([deal]), "deals", list_lookup)
+
+    details = result.iloc[0]["crmListMembershipDetails"]
+    assert details == [
+        {"id": "101", "name": "Enterprise Pipeline"},
+        {"id": "202", "name": "Q3 Renewals"},
+    ]
+
+
+def test_deal_list_memberships_resolve_from_a_numpy_array():
+    # Regression: a parquet-sourced multi-value column commonly loads as a numpy array, not
+    # a plain Python list. pd.isna() on an array-like raises "truth value of an array is
+    # ambiguous" if called unconditionally — this must not crash the whole chunk.
+    deal = {
+        "id": "339564136164",
+        "dealname": "vinay_bss",
+        "_hg_list_memberships": np.array(["101"]),
+    }
+
+    result = _handler()._populate_list_memberships(pd.DataFrame([deal]), "deals", {"101": "Enterprise Pipeline"})
+
+    assert result.iloc[0]["crmListMembershipDetails"] == [{"id": "101", "name": "Enterprise Pipeline"}]
+
+
+def test_deal_without_list_memberships_column_gets_a_null_field_not_an_error():
+    deal = {"id": "339564136164", "dealname": "vinay_bss"}
+
+    result = _handler()._populate_list_memberships(pd.DataFrame([deal]), "deals", {})
+
+    assert result.iloc[0]["crmListMembershipDetails"] is None
 
 
 if __name__ == "__main__":

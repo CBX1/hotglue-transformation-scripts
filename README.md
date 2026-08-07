@@ -225,6 +225,8 @@ Two derivations run on the association streams only, because the source shape ca
 
 Deals also **keep their archived rows** (unlike contacts/companies): `archived` is mirrored to `isDeleted` downstream, so dropping the row would leave a deleted deal looking live forever.
 
+Deals get the same `_hg_list_memberships` → `crmListMembershipDetails` resolution as contacts/companies (`HubSpotHandler.LIST_MEMBERSHIP_STREAMS`) — `Deal` inherits `crmListMembershipDetails` from `BaseTargetEntity` on the backend, so leaving deals out would mean the field is always null there even when HubSpot reports list membership.
+
 ## Write Policy
 
 - **Salesforce**: `contacts` are always written, split into `Contact` (account-linked) and `Lead` (accountless) by account linkage. `accounts` are written to the Salesforce `Account` object **when the flow has an `accounts/Account` mapping**. Contacts whose account has not yet synced to Salesforce are held back (not written as Leads) so they sync as `Contact`s once the account lands and the `Account` snapshot maps `CBX1-account-id → SF-Account-Id`. Other objects are not written.

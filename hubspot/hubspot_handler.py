@@ -89,6 +89,12 @@ class HubSpotHandler(BaseETLHandler):
         "associations_deals_contacts",
     }
 
+    # Streams whose _hg_list_memberships column is resolved into crmListMembershipDetails.
+    # Deals get the same treatment as contacts/companies: Deal extends BaseTargetEntity,
+    # which already carries crmListMembershipDetails, so leaving it out here would mean the
+    # field is always null for deals even when HubSpot reports list membership.
+    LIST_MEMBERSHIP_STREAMS: Set[str] = {"contacts", "companies", "deals"}
+
     # Columns required by _handle_global_unsubscribe — kept here so both the caller
     # (which slims the raw DataFrame) and the method stay in sync.
     UNSUBSCRIBE_REQUIRED_COLS: Set[str] = {
@@ -527,7 +533,7 @@ class HubSpotHandler(BaseETLHandler):
                     if stream == "contacts":
                         chunk_df = self._resolve_contact_account_ids(chunk_df, account_lookup)
                     chunk_df = self._merge_owner_details(chunk_df, owner_lookup, owner_column)
-                    if stream in {"contacts", "companies"}:
+                    if stream in self.LIST_MEMBERSHIP_STREAMS:
                         chunk_df = self._populate_list_memberships(chunk_df, stream, list_lookup)
                 chunk_df = self._wrap_records_with_metadata(chunk_df, stream)
 
@@ -828,11 +834,17 @@ class HubSpotHandler(BaseETLHandler):
 
         def build_membership_details(list_memberships):
             """Convert list IDs to list of {id, name} objects."""
-            if pd.isna(list_memberships) or list_memberships is None:
+            if list_memberships is None:
+                return None
+            # pd.isna() raises ValueError on array-likes ("truth value of an array is
+            # ambiguous") — only call it once list/tuple/ndarray inputs are ruled out, since
+            # a parquet-sourced multi-value column commonly loads as a numpy array.
+            is_list_like = isinstance(list_memberships, (list, tuple, np.ndarray))
+            if not is_list_like and pd.isna(list_memberships):
                 return None
 
             list_ids = []
-            if isinstance(list_memberships, list):
+            if is_list_like:
                 list_ids = [str(lid) for lid in list_memberships if lid is not None]
             elif isinstance(list_memberships, str):
                 try:
