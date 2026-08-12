@@ -605,8 +605,9 @@ class HubSpotHandler(BaseETLHandler):
 
         Sets accountId=None for contacts whose associatedcompanyid is missing or absent
         from the snapshot — the backend's own fallback (companyName/domain/email-domain)
-        can still kick in downstream. associatedcompanyid is dropped after translation
-        so the wrapped Singer payload does not leak the raw HubSpot id.
+        can still kick in downstream. associatedcompanyid is kept in the payload so the
+        backend can resolve the account itself via tenantEnrichmentMappings when the
+        snapshot lookup misses (CB-12898).
         """
         if df is None or df.empty:
             return df
@@ -618,8 +619,6 @@ class HubSpotHandler(BaseETLHandler):
             df["accountId"] = company_ids.map(account_lookup).where(
                 company_ids.notna() & company_ids.isin(account_lookup), None
             )
-
-        df = df.drop(columns=["associatedcompanyid"], errors="ignore")
 
         resolved = df["accountId"].notna().sum() if "accountId" in df.columns else 0
         logger.info("Resolved accountId for %d/%d contacts in chunk", resolved, len(df))
@@ -778,7 +777,7 @@ class HubSpotHandler(BaseETLHandler):
             df["hubspot_owner_id"] = None
 
         # Ensure associatedcompanyid exists on contacts; _resolve_contact_account_ids
-        # consumes it to derive accountId and drops it before wrapping.
+        # consumes it to derive accountId and it stays in the payload for the backend.
         if stream == "contacts":
             if "associatedcompanyid" not in df.columns:
                 df["associatedcompanyid"] = None
