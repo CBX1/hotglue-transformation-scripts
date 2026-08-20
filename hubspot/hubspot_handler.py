@@ -501,9 +501,17 @@ class HubSpotHandler(BaseETLHandler):
         logger.info("Starting HubSpot read operation (chunked passthrough + context enrichment)")
 
         data_streams = self.list_available_streams()
-        if not data_streams or not self.mapping_for_flow:
-            logger.warning("No streams or mapping available for read operation")
+        if not data_streams:
+            logger.warning("No streams available for read operation")
             return
+        # Form and association streams pass through without field mapping; only CRM
+        # streams need a tenant mapping entry for this flow. Flows that carry solely
+        # pass-through streams (e.g. the forms flow) have no mapping at all.
+        if not self.mapping_for_flow:
+            logger.warning(
+                "No mapping for flow %s — only pass-through streams will be processed",
+                self.flow_id,
+            )
 
         # Build small lookup tables once — these stay in memory throughout (< 1 MB each)
         owner_lookup = self._prepare_owner_lookup(data_streams)
@@ -515,6 +523,13 @@ class HubSpotHandler(BaseETLHandler):
         logger.info("HubSpot read order: %s", target_streams)
 
         for stream in target_streams:
+            if (
+                not self.mapping_for_flow
+                and stream not in self.FORM_STREAMS
+                and stream not in self.ASSOCIATION_STREAMS
+            ):
+                logger.warning("Skipping mapped stream %s: no mapping for flow", stream)
+                continue
             logger.info("Processing read stream (chunked): %s", stream)
             output_stream = inverse_mapping.get(stream, stream)
             first_chunk = True

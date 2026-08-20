@@ -339,6 +339,42 @@ def test_realistic_forms_batch():
     assert wrapped.iloc[0]["sourceRecordId"] == FORM_ID
 
 
+def test_handle_read_without_mapping_processes_form_streams_only():
+    """A flow with no tenant mapping (the forms flow) must still emit the
+    pass-through form streams, while mapped CRM streams are skipped."""
+    import hubspot_handler as hh
+
+    handler = _handler()
+    handler.mapping_for_flow = {}
+    handler.flow_id = "vUZid8TMR"
+    handler.input_dir = "unused"
+    handler.output_dir = "unused"
+    handler.list_available_streams = lambda: ["contacts", "form_submissions", "forms"]
+    handler._prepare_owner_lookup = lambda streams: None
+    handler._prepare_list_lookup = lambda streams: None
+    handler._prepare_account_lookup = lambda: None
+
+    chunks = {
+        "forms": pd.DataFrame([FORM_RECORD]),
+        "form_submissions": pd.DataFrame([FORM_SUBMISSION_RECORD]),
+        "contacts": pd.DataFrame([{"id": "1", "email": "a@b.com"}]),
+    }
+    written = []
+    orig_iter, orig_append = hh.iter_stream_chunks, hh.append_singer_records
+    hh.iter_stream_chunks = lambda input_dir, stream: iter([chunks[stream]])
+    hh.append_singer_records = (
+        lambda df, stream, output_dir, first: written.append((stream, len(df)))
+    )
+    try:
+        handler.handle_read()
+    finally:
+        hh.iter_stream_chunks, hh.append_singer_records = orig_iter, orig_append
+
+    written_streams = [s for s, _ in written]
+    assert written_streams == ["forms", "form_submissions"]
+    assert all(count == 1 for _, count in written)
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:
