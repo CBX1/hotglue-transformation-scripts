@@ -22,25 +22,40 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from hubspot_handler import HubSpotHandler  # noqa: E402
 
 
+FORM_ID = "f0e9611b-9dd1-424a-ad08-2bf42614b35f"
+
 FORM_RECORD = {
-    "id": "f0e9611b-1234-5678-9abc-def012345678",
-    "name": "Contact Us Form",
+    "id": FORM_ID,
+    "name": "Paginated Form",
+    "fieldGroups": json.dumps([{
+        "groupType": "default_group",
+        "richTextType": "text",
+        "fields": [
+            {"objectTypeId": "0-1", "name": "firstname", "label": "First Name",
+             "required": False, "hidden": False, "fieldType": "single_line_text"},
+            {"objectTypeId": "0-1", "name": "email", "label": "Email",
+             "required": True, "hidden": False, "fieldType": "single_line_text"},
+        ],
+    }]),
+    "configuration": json.dumps({"language": "en", "cloneable": True}),
+    "displayOptions": json.dumps({"renderRawHtml": False, "theme": "default_style"}),
+    "legalConsentOptions": json.dumps({"type": "none"}),
     "formType": "hubspot",
     "archived": False,
-    "createdAt": "2026-01-01T00:00:00Z",
-    "updatedAt": "2026-08-19T12:00:00Z",
+    "userId": float("nan"),
+    "createdAt": pd.Timestamp("2026-08-19 21:45:23.440"),
+    "updatedAt": pd.Timestamp("2026-08-19 21:48:22.223"),
 }
 
 FORM_SUBMISSION_RECORD = {
-    "form_id": "f0e9611b-1234-5678-9abc-def012345678",
-    "conversionId": "abc123",
-    "pageUrl": "https://example.com/landing",
+    "form_id": FORM_ID,
+    "conversionId": "55bc5c7f-65ef-4669-b84b-9f99d86d23fe",
+    "pageUrl": "https://example.com/spike-test",
     "values": json.dumps([
-        {"name": "email", "value": "test@example.com", "objectTypeId": "0-1"},
-        {"name": "firstname", "value": "John", "objectTypeId": "0-1"},
-        {"name": "lastname", "value": "Doe", "objectTypeId": "0-1"},
+        {"name": "firstname", "value": "Maya", "objectTypeId": "0-1"},
+        {"name": "email", "value": "maya.iyer@cbxspiketest.com", "objectTypeId": "0-1"},
     ]),
-    "submittedAt": "2026-08-19T22:05:00Z",
+    "submittedAt": pd.Timestamp("2026-08-19 21:49:12.801"),
 }
 
 
@@ -87,8 +102,8 @@ def test_forms_wrap_with_id_as_lookup_key():
     wrapped = _handler()._wrap_records_with_metadata(pd.DataFrame([FORM_RECORD]), "forms")
     assert len(wrapped) == 1
     row = wrapped.iloc[0]
-    assert row["lookupKey"] == "f0e9611b-1234-5678-9abc-def012345678"
-    assert row["sourceRecordId"] == "f0e9611b-1234-5678-9abc-def012345678"
+    assert row["lookupKey"] == FORM_ID
+    assert row["sourceRecordId"] == FORM_ID
     assert row["source"] == "HUBSPOT"
 
 
@@ -102,8 +117,16 @@ def test_forms_wrap_preserves_archived_flag():
 def test_forms_wrap_preserves_form_fields():
     wrapped = _handler()._wrap_records_with_metadata(pd.DataFrame([FORM_RECORD]), "forms")
     data = wrapped.iloc[0]["data"]
-    assert data["name"] == "Contact Us Form"
+    assert data["name"] == "Paginated Form"
     assert data["formType"] == "hubspot"
+
+
+def test_forms_wrap_preserves_json_string_fields():
+    wrapped = _handler()._wrap_records_with_metadata(pd.DataFrame([FORM_RECORD]), "forms")
+    data = wrapped.iloc[0]["data"]
+    assert "fieldGroups" in data
+    assert "configuration" in data
+    assert "legalConsentOptions" in data
 
 
 # ---------------------------------------------------------------------------
@@ -116,8 +139,8 @@ def test_form_submissions_extract_email_as_lookup_key():
     )
     assert len(wrapped) == 1
     row = wrapped.iloc[0]
-    assert row["lookupKey"] == "test@example.com"
-    assert row["sourceRecordId"] == "abc123"
+    assert row["lookupKey"] == "maya.iyer@cbxspiketest.com"
+    assert row["sourceRecordId"] == "55bc5c7f-65ef-4669-b84b-9f99d86d23fe"
     assert row["source"] == "HUBSPOT"
 
 
@@ -139,7 +162,7 @@ def test_form_submissions_uses_conversion_id_as_source_record_id():
     wrapped = _handler()._wrap_records_with_metadata(
         pd.DataFrame([FORM_SUBMISSION_RECORD]), "form_submissions"
     )
-    assert wrapped.iloc[0]["sourceRecordId"] == "abc123"
+    assert wrapped.iloc[0]["sourceRecordId"] == "55bc5c7f-65ef-4669-b84b-9f99d86d23fe"
 
 
 def test_form_submissions_handles_values_as_list():
@@ -243,6 +266,77 @@ def test_form_submissions_have_no_archived_field():
     df = pd.DataFrame([FORM_SUBMISSION_RECORD])
     result = handler._filter_archived_records(df, "form_submissions")
     assert len(result) == 1
+
+
+# ---------------------------------------------------------------------------
+# Realistic batch (mirrors actual spike job _al-J output)
+# ---------------------------------------------------------------------------
+
+def test_realistic_submission_batch():
+    """Process a batch resembling real tap-hubspot parquet output from the spike job."""
+    batch = [
+        {
+            "form_id": FORM_ID,
+            "conversionId": "55bc5c7f-65ef-4669-b84b-9f99d86d23fe",
+            "pageUrl": "https://example.com/spike-test",
+            "values": json.dumps([
+                {"name": "firstname", "value": "Maya", "objectTypeId": "0-1"},
+                {"name": "email", "value": "maya.iyer@cbxspiketest.com", "objectTypeId": "0-1"},
+            ]),
+            "submittedAt": pd.Timestamp("2026-08-19 21:49:12.801"),
+        },
+        {
+            "form_id": FORM_ID,
+            "conversionId": "a4d32deb-9ee1-49eb-ad8d-2b7647562330",
+            "pageUrl": "https://example.com/spike-test",
+            "values": json.dumps([
+                {"name": "email", "value": "spike-test-055@example.com", "objectTypeId": "0-1"},
+            ]),
+            "submittedAt": pd.Timestamp("2026-08-19 21:47:40.663"),
+        },
+        {
+            "form_id": FORM_ID,
+            "conversionId": "c71f4347-3b57-4b37-bbc6-44c133ab989b",
+            "pageUrl": "https://example.com/spike-test",
+            "values": json.dumps([
+                {"name": "email", "value": "spike-test-054@example.com", "objectTypeId": "0-1"},
+            ]),
+            "submittedAt": pd.Timestamp("2026-08-19 21:47:40.209"),
+        },
+    ]
+    df = pd.DataFrame(batch)
+    wrapped = _handler()._wrap_records_with_metadata(df, "form_submissions")
+
+    assert len(wrapped) == 3
+    assert list(wrapped["lookupKey"]) == [
+        "maya.iyer@cbxspiketest.com",
+        "spike-test-055@example.com",
+        "spike-test-054@example.com",
+    ]
+    assert list(wrapped["sourceRecordId"]) == [
+        "55bc5c7f-65ef-4669-b84b-9f99d86d23fe",
+        "a4d32deb-9ee1-49eb-ad8d-2b7647562330",
+        "c71f4347-3b57-4b37-bbc6-44c133ab989b",
+    ]
+    for _, row in wrapped.iterrows():
+        assert row["source"] == "HUBSPOT"
+        assert row["data"]["form_id"] == FORM_ID
+        assert "values" in row["data"]
+
+
+def test_realistic_forms_batch():
+    """Process a forms record with the full column set from parquet."""
+    df = pd.DataFrame([FORM_RECORD])
+    wrapped = _handler()._wrap_records_with_metadata(df, "forms")
+
+    assert len(wrapped) == 1
+    data = wrapped.iloc[0]["data"]
+    assert data["id"] == FORM_ID
+    assert data["name"] == "Paginated Form"
+    assert data["formType"] == "hubspot"
+    assert data["archived"] is False
+    assert wrapped.iloc[0]["lookupKey"] == FORM_ID
+    assert wrapped.iloc[0]["sourceRecordId"] == FORM_ID
 
 
 if __name__ == "__main__":
