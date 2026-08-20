@@ -94,7 +94,7 @@ jobs:
           # connectors run whatever was last deployed (stale), which is how Salesforce writes
           # silently ran old code.
           for TAP in hubspot salesforce; do
-            echo "::group::Deploy ETL --tap $TAP"
+            echo "::group::Deploy ETL --flow AJ3x0LMYI --tap $TAP"
             npx -y @hotglue/cli@1.1.0 etl deploy \
               --sourceFolder ./hubspot \
               --env "$HOTGLUE_ENV" \
@@ -103,3 +103,17 @@ jobs:
               --apikey "$HOTGLUE_API_KEY"
             echo "::endgroup::"
           done
+
+          # vUZid8TMR (Sync Forms and Form Submissions) runs the same ETL script.
+          # It only exists in dev.different.ai — drop this guard once the flow is
+          # promoted to prod (flow IDs are shared across environments).
+          if [ "$HOTGLUE_ENV" = "dev.different.ai" ]; then
+            echo "::group::Deploy ETL --flow vUZid8TMR --tap hubspot"
+            npx -y @hotglue/cli@1.1.0 etl deploy \
+              --sourceFolder ./hubspot \
+              --env "$HOTGLUE_ENV" \
+              --flow vUZid8TMR \
+              --tap hubspot \
+              --apikey "$HOTGLUE_API_KEY"
+            echo "::endgroup::"
+          fi
