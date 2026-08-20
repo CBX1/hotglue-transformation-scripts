@@ -80,6 +80,8 @@ class HubSpotHandler(BaseETLHandler):
         "companies",
         "contacts",
         "deals",
+        "forms",
+        "form_submissions",
         "associations_deals_companies",
         "associations_deals_contacts",
     )
@@ -88,6 +90,8 @@ class HubSpotHandler(BaseETLHandler):
         "associations_deals_companies",
         "associations_deals_contacts",
     }
+
+    FORM_STREAMS: Set[str] = {"forms", "form_submissions"}
 
     # Streams whose _hg_list_memberships column is resolved into crmListMembershipDetails.
     # Deals get the same treatment as contacts/companies: Deal extends BaseTargetEntity,
@@ -517,17 +521,20 @@ class HubSpotHandler(BaseETLHandler):
             total_written = 0
 
             for chunk_df in iter_stream_chunks(self.input_dir, stream):
-                # Deals keep their archived rows: `archived` is mirrored to isDeleted so
-                # a deleted deal is visible downstream. Dropping the row would leave the
-                # previously-synced deal looking live forever.
-                if stream != "deals":
+                # Deals and forms keep their archived rows: deals mirror `archived` to
+                # isDeleted; forms pass `archived` through so the backend can set
+                # isActive=false on SyncedForm.
+                if stream not in ("deals", "forms"):
                     chunk_df = self._filter_archived_records(chunk_df, stream)
                 if chunk_df is None or chunk_df.empty:
                     continue
 
-                if stream in self.ASSOCIATION_STREAMS:
+                if stream in self.FORM_STREAMS:
+                    chunk_df = self._wrap_records_with_metadata(chunk_df, stream)
+                elif stream in self.ASSOCIATION_STREAMS:
                     chunk_df = self._build_association_lookup_key(chunk_df)
                     chunk_df = self._derive_association_flags(chunk_df)
+                    chunk_df = self._wrap_records_with_metadata(chunk_df, stream)
                 else:
                     chunk_df, owner_column = self._apply_read_mapping(chunk_df, stream)
                     if stream == "contacts":
@@ -535,7 +542,7 @@ class HubSpotHandler(BaseETLHandler):
                     chunk_df = self._merge_owner_details(chunk_df, owner_lookup, owner_column)
                     if stream in self.LIST_MEMBERSHIP_STREAMS:
                         chunk_df = self._populate_list_memberships(chunk_df, stream, list_lookup)
-                chunk_df = self._wrap_records_with_metadata(chunk_df, stream)
+                    chunk_df = self._wrap_records_with_metadata(chunk_df, stream)
 
                 if chunk_df is None or chunk_df.empty:
                     continue
@@ -975,6 +982,10 @@ class HubSpotHandler(BaseETLHandler):
             lookup_field, id_field = "domain", "id"
         elif stream == "deals":
             lookup_field, id_field = "id", "id"
+        elif stream == "forms":
+            lookup_field, id_field = "id", "id"
+        elif stream == "form_submissions":
+            lookup_field, id_field = None, "conversionId"
         elif stream in self.ASSOCIATION_STREAMS:
             lookup_field, id_field = "lookupKey", "lookupKey"
         else:
@@ -989,15 +1000,20 @@ class HubSpotHandler(BaseETLHandler):
             logger.warning(f"Missing '{id_field}' field in {stream}, skipping chunk")
             return pd.DataFrame(columns=_WRAPPED_COLS)
 
-        if lookup_field not in df.columns:
+        # form_submissions derive lookupKey at wrap time — no column required on input
+        if lookup_field is not None and lookup_field not in df.columns:
             logger.warning(f"Missing '{lookup_field}' field in {stream}, skipping chunk")
             return pd.DataFrame(columns=_WRAPPED_COLS)
 
-        # Filter out records with null lookup key (email or domain)
+        # Filter out records with null lookup key (email or domain).
+        # form_submissions derive lookupKey later and allow null, so skip filtering.
         df = df.copy()
-        initial_count = len(df)
-        df = df[df[lookup_field].notna() & (df[lookup_field].astype(str).str.strip() != "")]
-        filtered_count = initial_count - len(df)
+        if lookup_field is not None:
+            initial_count = len(df)
+            df = df[df[lookup_field].notna() & (df[lookup_field].astype(str).str.strip() != "")]
+            filtered_count = initial_count - len(df)
+        else:
+            filtered_count = 0
 
         if filtered_count > 0:
             logger.info(f"Filtered out {filtered_count} {stream} records with null or empty {lookup_field}")
@@ -1019,11 +1035,18 @@ class HubSpotHandler(BaseETLHandler):
             cleaned_record = self._clean_record_for_serialization(record)
             cleaned_record["source"] = "HUBSPOT"
 
+            if lookup_field is None:
+                record_lookup_key = self._extract_email_from_form_values(
+                    record.get("values")
+                )
+            else:
+                record_lookup_key = record.get(lookup_field)
+
             wrapped = {
                 "data": cleaned_record,
                 "sourceRecordId": record.get(id_field),
                 "source": "HUBSPOT",
-                "lookupKey": record.get(lookup_field)
+                "lookupKey": record_lookup_key,
             }
             wrapped_records.append(wrapped)
 
@@ -1032,6 +1055,33 @@ class HubSpotHandler(BaseETLHandler):
 
         logger.info(f"Wrapped {len(wrapped_df)} {stream} records with metadata structure and source='HUBSPOT'")
         return wrapped_df
+
+    @staticmethod
+    def _extract_email_from_form_values(values) -> Optional[str]:
+        """Extract the email address from a form_submissions values field.
+
+        The field may arrive as a JSON string or as a Python list of dicts.
+        Returns None when no email is found — the backend handles null lookupKey
+        gracefully (persists with null contactId, skips trigger emit).
+        """
+        if values is None:
+            return None
+
+        if isinstance(values, str):
+            try:
+                values = json.loads(values)
+            except (json.JSONDecodeError, TypeError):
+                return None
+
+        if not isinstance(values, list):
+            return None
+
+        for entry in values:
+            if isinstance(entry, dict) and str(entry.get("name", "")).lower() == "email":
+                email = entry.get("value")
+                if email and str(email).strip():
+                    return str(email).strip()
+        return None
 
     def _clean_record_for_serialization(self, obj):
         """
