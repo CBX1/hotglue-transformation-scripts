@@ -31,6 +31,8 @@ from typing import Dict, Optional, Tuple
 
 import gluestick as gs
 
+from utils import reset_singer_output
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -265,6 +267,11 @@ def main() -> None:
     # strings must be repr()-wrapped to survive as scalars. The read direction
     # (CRM -> CBX1) feeds cbx1-target, which does not — leave it False there.
     handler.neutralize_container_literals = (job_type == "write")
+
+    # Every writer appends to etl-output/data.singer, and HotGlue retries the
+    # transform script without clearing etl-output — so a run that does not start
+    # from an empty file emits a second copy of everything it already wrote.
+    reset_singer_output(OUTPUT_DIR)
 
     # Execute the appropriate operation
     try:

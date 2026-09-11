@@ -16,11 +16,13 @@ both Salesforce and HubSpot connector operations.
 """
 
 import ast
+import errno
 import glob
 import json as _json
 import logging
 import os
 import re
+import shutil
 from typing import Dict, Iterator, List, Optional, Tuple
 
 import pandas as pd
@@ -865,6 +867,89 @@ def _detect_singer_col_type(series: "pd.Series", sample_size: int = 100) -> list
     return types
 
 
+def reset_singer_output(output_dir: str) -> None:
+    """
+    Delete any ``data.singer`` left in ``output_dir`` before a run starts writing.
+
+    Both writers append — ``append_singer_records`` on the read path and
+    ``gs.to_singer`` on the write path — and HotGlue retries the transform script
+    in-process (``backoff`` around ``run_transform_cmd``) without clearing
+    ``etl-output``. Without this reset a retry appends a second complete copy of
+    the dataset onto the first attempt's file: every record is emitted twice
+    downstream and, on a large tenant, the container disk fills (ENOSPC).
+    """
+    output_path = os.path.join(output_dir, "data.singer")
+    if not os.path.isfile(output_path):
+        return
+
+    stale_bytes = os.path.getsize(output_path)
+    os.remove(output_path)
+    logger.warning(
+        "Removed stale %s from a previous attempt of this job (%.1f MB) — "
+        "this run starts from an empty Singer output",
+        output_path,
+        stale_bytes / 1024 ** 2,
+    )
+
+
+def _disk_pressure_detail(output_path: str) -> str:
+    """Describe how much was written and how much room is left, for ENOSPC logs."""
+    try:
+        written = f"{os.path.getsize(output_path) / 1024 ** 2:.0f} MB written"
+    except OSError:
+        written = "size unreadable"
+    try:
+        usage = shutil.disk_usage(os.path.dirname(output_path) or ".")
+        space = f"{usage.free / 1024 ** 2:.0f} MB free of {usage.total / 1024 ** 3:.1f} GB"
+    except OSError:
+        space = "free space unreadable"
+    return f"{output_path}: {written}, {space}"
+
+
+def _strip_nulls(value):
+    """
+    Recursively drop keys whose value is null, returning JSON-ready data.
+
+    The read path wraps every source row inside a ``data`` object, so a
+    top-level-only filter never reaches the actual fields. tap-hubspot emits a
+    rectangular union of every property seen across the portal — ~1,030 columns
+    for a large tenant — and ``_clean_record_for_serialization`` normalises each
+    absent one to ``None``. Keeping those keys re-materialises "HubSpot returned
+    no value" as an explicit JSON ``null``: 802 of 1,030 fields per contact and
+    69% of the payload on thoughtspot, which is what filled the job disk.
+
+    Lists are walked so nulls inside nested objects (e.g. the entries of
+    ``crmListMembershipDetails``) are dropped too. Empty dicts and empty lists
+    are preserved — only nulls are removed.
+    """
+    if isinstance(value, dict):
+        return {
+            k: _strip_nulls(v)
+            for k, v in value.items()
+            if not _is_null(v)
+        }
+    if isinstance(value, list):
+        return [_strip_nulls(v) for v in value if not _is_null(v)]
+    return value
+
+
+def _is_null(value) -> bool:
+    """True for None and the pandas/numpy missing-value scalars."""
+    if value is None:
+        return True
+    if isinstance(value, float):
+        return pd.isna(value)
+    # pd.NaT / pd.NA are not floats; pd.isna on a container returns an array, so
+    # only scalars reach the general check.
+    if isinstance(value, (dict, list, tuple, set, str, bytes, bool, int)):
+        return False
+    try:
+        result = pd.isna(value)
+    except (TypeError, ValueError):
+        return False
+    return result is True
+
+
 def append_singer_records(
     df: pd.DataFrame,
     stream_name: str,
@@ -882,38 +967,48 @@ def append_singer_records(
 
     Columns containing dict / list values are declared with ``object`` / ``array``
     types in the SCHEMA so nested values flow through to downstream consumers as
-    real JSON structures. Null values are omitted from each record.
+    real JSON structures. Null values are omitted from each record at every depth
+    — see ``_strip_nulls``.
     """
     output_path = os.path.join(output_dir, "data.singer")
     mode = "a" if os.path.isfile(output_path) else "w"
 
-    with open(output_path, mode, encoding="utf-8") as fh:
-        if first_chunk:
-            # Per-column type detection. boolean is required so HubSpot boolean
-            # fields (e.g. hs_email_optout) are not cast to strings by the
-            # downstream loader; object/array are required so wrapper columns
-            # like ``data`` round-trip as navigable JSON instead of TextNodes.
-            properties = {
-                col: {"type": _detect_singer_col_type(df[col])} for col in df.columns
-            }
-            schema_msg = {
-                "type": "SCHEMA",
-                "stream": stream_name,
-                "schema": {"type": "object", "properties": properties},
-                "key_properties": [],
-            }
-            fh.write(_json.dumps(schema_msg) + "\n")
+    try:
+        with open(output_path, mode, encoding="utf-8") as fh:
+            if first_chunk:
+                # Per-column type detection. boolean is required so HubSpot boolean
+                # fields (e.g. hs_email_optout) are not cast to strings by the
+                # downstream loader; object/array are required so wrapper columns
+                # like ``data`` round-trip as navigable JSON instead of TextNodes.
+                properties = {
+                    col: {"type": _detect_singer_col_type(df[col])} for col in df.columns
+                }
+                schema_msg = {
+                    "type": "SCHEMA",
+                    "stream": stream_name,
+                    "schema": {"type": "object", "properties": properties},
+                    "key_properties": [],
+                }
+                fh.write(_json.dumps(schema_msg) + "\n")
 
-        for record in df.to_dict(orient="records"):
-            clean: dict = {}
-            for k, v in record.items():
-                if v is None or (isinstance(v, float) and pd.isna(v)):
-                    continue
-                clean[k] = v
-            fh.write(
-                _json.dumps(
-                    {"type": "RECORD", "stream": stream_name, "record": clean},
-                    default=str,
+            for record in df.to_dict(orient="records"):
+                clean = _strip_nulls(record)
+                fh.write(
+                    _json.dumps(
+                        {"type": "RECORD", "stream": stream_name, "record": clean},
+                        default=str,
+                    )
+                    + "\n"
                 )
-                + "\n"
+    except OSError as exc:
+        if exc.errno == errno.ENOSPC:
+            # A full disk also breaks HotGlue's own stdout-timestamp file, and the
+            # executor surfaces the resulting truncated-JSON error ("Expecting ','
+            # delimiter: line 1 column 20481") instead of this one. Name the real
+            # cause here so the job log carries it.
+            logger.error(
+                "Singer output hit ENOSPC on stream '%s' — %s",
+                stream_name,
+                _disk_pressure_detail(output_path),
             )
+        raise
