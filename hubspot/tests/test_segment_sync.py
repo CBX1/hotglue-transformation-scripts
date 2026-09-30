@@ -149,13 +149,13 @@ def test_every_membership_record_is_addressed_by_list_id():
 # --- Full deliveries ---
 
 
-def test_full_delivery_numbers_its_batches_under_one_run_id():
+def test_full_delivery_numbers_its_batches_and_carries_no_run_id():
     members = [str(n) for n in range(ss.MEMBER_BATCH_SIZE * 2 + 5)]
     records = ss.build_full_delivery_records("77", members, JOB)
     payloads = [_data(r) for r in records]
 
     assert len(payloads) == 3
-    assert {p["fullSyncRunId"] for p in payloads} == {payloads[0]["fullSyncRunId"]}
+    assert all("fullSyncRunId" not in p for p in payloads)
     assert [p["batchNumber"] for p in payloads] == [1, 2, 3]
     assert all(p["totalBatches"] == 3 for p in payloads)
 
@@ -163,6 +163,45 @@ def test_full_delivery_numbers_its_batches_under_one_run_id():
     # lets the backend verify the assembled result once the last batch lands.
     assert {p["fullMemberSetFingerprint"] for p in payloads} == {ss.member_set_fingerprint(members)}
     assert sorted(i for p in payloads for i in p["memberIds"]) == sorted(members)
+
+
+def test_the_same_set_always_produces_the_same_delivery():
+    # The backend resumes an unfinished delivery by its fingerprint and batch count, so a
+    # re-send of the same set must slice identically, in any input order.
+    members = [str(n) for n in range(ss.MEMBER_BATCH_SIZE + 7)]
+    first = ss.build_full_delivery_records("77", members, JOB, ["x", "y"])
+    second = ss.build_full_delivery_records("77", list(reversed(members)), JOB, ["y", "x"])
+    assert first == second
+
+
+def test_full_delivery_removes_members_possibly_held_after_the_set():
+    records = ss.build_full_delivery_records("77", ["1", "2", "6"], JOB, ["1", "2", "3", "4", "5"])
+    payloads = [_data(r) for r in records]
+
+    assert [p.get("memberIds") for p in payloads] == [["1", "2", "6"], None]
+    assert payloads[1]["removedMemberIds"] == ["3", "4", "5"]
+    assert [p["batchNumber"] for p in payloads] == [1, 2]
+    assert all(p["totalBatches"] == 2 for p in payloads)
+    assert {p["fullMemberSetFingerprint"] for p in payloads} == {ss.member_set_fingerprint(["1", "2", "6"])}
+
+
+def test_removal_batches_respect_the_record_cap():
+    held = [f"old-{n}" for n in range(ss.MEMBER_BATCH_SIZE * 2 + 1)]
+    records = ss.build_full_delivery_records("77", ["1"], JOB, held)
+    removal_payloads = [_data(r) for r in records if "removedMemberIds" in _data(r)]
+
+    assert len(removal_payloads) == 3
+    assert all(len(p["removedMemberIds"]) <= ss.MEMBER_BATCH_SIZE for p in removal_payloads)
+    assert sorted(i for p in removal_payloads for i in p["removedMemberIds"]) == sorted(held)
+
+
+def test_emptying_a_list_by_full_delivery_sends_only_removals():
+    records = ss.build_full_delivery_records("77", [], JOB, ["1", "2"])
+    payloads = [_data(r) for r in records]
+
+    assert len(payloads) == 1
+    assert payloads[0]["removedMemberIds"] == ["1", "2"]
+    assert payloads[0]["fullMemberSetFingerprint"] == ss.EMPTY_MEMBER_SET_FINGERPRINT
 
 
 def test_full_delivery_of_an_empty_list_still_sends_one_batch():
@@ -282,6 +321,74 @@ def test_snapshot_overwrites_and_never_merges(tmp_path):
     snapshot = ss.read_list_snapshot(str(tmp_path), "FLOW1", "77")
     assert snapshot["members"] == {"2"}
     assert snapshot["change_signals"] == SIGNALS_B
+
+
+def test_snapshot_history_round_trips(tmp_path):
+    ss.write_list_snapshot(
+        str(tmp_path), "FLOW1", "77", ["1", "2", "4"], SIGNALS_A, confirmed_members=["1", "2", "3"], sent_since_confirmed=["4"]
+    )
+    snapshot = ss.read_list_snapshot(str(tmp_path), "FLOW1", "77")
+    assert snapshot["confirmed_members"] == {"1", "2", "3"}
+    assert snapshot["sent_since_confirmed"] == {"4"}
+
+
+def test_a_confirmed_latest_set_is_stored_once(tmp_path):
+    # HotGlue re-uploads every snapshot with every job, so the confirmed set is not repeated
+    # when it equals the latest one.
+    ss.write_list_snapshot(str(tmp_path), "FLOW1", "77", ["1", "2"], SIGNALS_A, confirmed_members=["2", "1"])
+    with open(ss.member_snapshot_path(str(tmp_path), "FLOW1", "77"), encoding="utf-8") as handle:
+        stored = json.load(handle)
+    assert "confirmed_members" not in stored
+    assert ss.read_list_snapshot(str(tmp_path), "FLOW1", "77")["confirmed_members"] == {"1", "2"}
+
+
+def test_a_snapshot_never_confirmed_has_no_confirmed_members(tmp_path):
+    ss.write_list_snapshot(str(tmp_path), "FLOW1", "77", ["1"], SIGNALS_A, sent_since_confirmed=["1"])
+    assert ss.read_list_snapshot(str(tmp_path), "FLOW1", "77")["confirmed_members"] is None
+
+
+def test_confirming_the_latest_set_drops_the_history():
+    snapshot = {"members": {"1", "2"}, "change_signals": None, "confirmed_members": {"1"}, "sent_since_confirmed": {"2"}}
+    assert ss.apply_confirmation(snapshot, ss.member_set_fingerprint({"1", "2"}))
+    assert snapshot["confirmed_members"] == {"1", "2"}
+    assert snapshot["sent_since_confirmed"] == set()
+
+
+def test_a_confirmation_of_anything_else_keeps_the_history():
+    # A late or stale confirmation can only make the history longer than needed, never shorter.
+    snapshot = {"members": {"1", "2"}, "change_signals": None, "confirmed_members": {"1"}, "sent_since_confirmed": {"2"}}
+    assert not ss.apply_confirmation(snapshot, ss.member_set_fingerprint({"9"}))
+    assert not ss.apply_confirmation(snapshot, None)
+    assert snapshot["confirmed_members"] == {"1"}
+    assert snapshot["sent_since_confirmed"] == {"2"}
+
+
+def test_members_possibly_held_covers_the_confirmed_set_and_everything_sent_since():
+    snapshot = {"members": {"1", "4"}, "change_signals": None, "confirmed_members": {"1", "2", "3"}, "sent_since_confirmed": {"4", "5"}}
+    assert ss.members_possibly_held(snapshot) == {"1", "2", "3", "4", "5"}
+    assert ss.members_possibly_held(None) == set()
+
+
+def test_a_snapshot_written_before_the_history_still_counts_its_members_as_held():
+    snapshot = {"members": {"1", "2"}, "change_signals": None, "confirmed_members": None, "sent_since_confirmed": set()}
+    assert ss.members_possibly_held(snapshot) == {"1", "2"}
+
+
+def test_a_snapshot_written_before_the_history_keeps_its_members_held_after_a_rewrite(tmp_path):
+    # If the one removal record for "1" is lost, a later full delivery must still remove it.
+    ss.write_list_snapshot(str(tmp_path), "FLOW1", "77", ["1", "2"], SIGNALS_A)
+    snapshot = ss.read_list_snapshot(str(tmp_path), "FLOW1", "77")
+    ss.write_list_snapshot(
+        str(tmp_path), "FLOW1", "77", ["2"], SIGNALS_B, sent_since_confirmed=snapshot["sent_since_confirmed"]
+    )
+    assert ss.members_possibly_held(ss.read_list_snapshot(str(tmp_path), "FLOW1", "77")) == {"1", "2"}
+
+
+def test_a_paused_snapshot_never_confirmed_counts_none_of_its_members_as_sent(tmp_path):
+    ss.write_list_snapshot(str(tmp_path), "FLOW1", "77", ["1", "2"], SIGNALS_A, is_membership_paused=True)
+    snapshot = ss.read_list_snapshot(str(tmp_path), "FLOW1", "77")
+    assert snapshot["is_membership_paused"]
+    assert snapshot["sent_since_confirmed"] == set()
 
 
 def test_a_missing_snapshot_is_none_not_empty(tmp_path):
