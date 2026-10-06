@@ -160,8 +160,24 @@ def _get_handler(connector_id: str, flow_id: str, reader: gs.Reader,
         ValueError: If the connector_id is not supported
     """
     connector_id_lower = str(connector_id).lower() if connector_id else ""
-    
-    if connector_id_lower == "salesforce":
+
+    list_sync_flows = {f.strip() for f in os.environ.get("LIST_SYNC_FLOW_IDS", "").split(",") if f.strip()}
+    logger.info(f"List sync flows: {sorted(list_sync_flows)}; FLOW={flow_id}")
+
+    if connector_id_lower == "hubspot" and flow_id in list_sync_flows:
+        from hubspot_list_sync_handler import HubSpotListSyncHandler
+        return HubSpotListSyncHandler(
+            connector_id=connector_id,
+            flow_id=flow_id,
+            reader=reader,
+            mapping_for_flow=mapping_for_flow,
+            stream_name_mapping=stream_name_mapping,
+            input_dir=INPUT_DIR,
+            snapshot_dir=SNAPSHOT_DIR,
+            output_dir=OUTPUT_DIR,
+            target_config=target_config,
+        )
+    elif connector_id_lower == "salesforce":
         from salesforce_handler import SalesforceHandler
         return SalesforceHandler(
             connector_id=connector_id,
