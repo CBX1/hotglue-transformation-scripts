@@ -1,0 +1,60 @@
+name: Pytest Checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Pytest and SonarQube coverage gate
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    runs-on: [self-hosted, cbx1-gcp-runner]
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          # Full history so SonarQube can compute new code and blame.
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-test.txt
+
+      - name: Run tests with coverage
+        run: coverage run --source=hubspot --omit='hubspot/tests/*' -m pytest hubspot/tests
+
+      - name: Generate coverage report
+        run: |
+          coverage xml -o coverage.xml
+          coverage report
+
+      # sonar.qualitygate.wait makes the scanner poll the server and exit non-zero when
+      # the gate ("Sonar way": new-code coverage < 80% fails) is not passed, so this
+      # check itself goes red. The PR parameters are passed explicitly because
+      # sonar.ci.autoconfig.disabled=true turns off the scanner's CI auto-detection.
+      - name: SonarQube scan and quality gate
+        uses: sonarsource/sonarqube-scan-action@master
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        with:
+          args: >
+            -Dsonar.qualitygate.wait=true
+            -Dsonar.qualitygate.timeout=300
+            ${{ github.event_name == 'pull_request' && format('-Dsonar.pullrequest.key={0} -Dsonar.pullrequest.branch={1} -Dsonar.pullrequest.base={2}', github.event.pull_request.number, github.head_ref, github.base_ref) || '' }}
