@@ -1,0 +1,5 @@
+# CI/test-only dependencies. Kept at the repo root, outside hubspot/, so they are
+# not shipped with the ETL by `hotglue etl deploy --sourceFolder ./hubspot`.
+-r hubspot/requirements.txt
+pytest==9.1.1
+coverage==7.16.2
