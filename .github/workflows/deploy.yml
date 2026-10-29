@@ -41,7 +41,7 @@ concurrency:
 jobs:
   guard:
     name: Guard manual prod dispatch
-    runs-on: [self-hosted, cbx1-gcp-runner-small]
+    runs-on: cbx1-gke-runner-small
     if: github.event_name == 'workflow_dispatch'
     steps:
       - name: Reject prod dispatch from non-production ref
@@ -54,7 +54,7 @@ jobs:
 
   deploy:
     name: Deploy to HotGlue
-    runs-on: [self-hosted, cbx1-gcp-runner-small]
+    runs-on: cbx1-gke-runner-small
     needs: [guard]
     # `guard` is skipped for push events (its `if:` evaluates false), so accept
     # either success or skipped here.
