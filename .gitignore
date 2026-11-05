@@ -6,3 +6,7 @@ venv/
 .env
 *.env
 etl-output/
+.coverage
+coverage.xml
+.scannerwork/
+.pytest_cache/
