@@ -375,6 +375,46 @@ def test_handle_read_without_mapping_processes_form_streams_only():
     assert all(count == 1 for _, count in written)
 
 
+def test_handle_read_with_crm_mapping_also_processes_form_streams():
+    """Forms ride on the Accounts and Contacts flow: with a CRM mapping present,
+    the form streams still pass through next to the mapped CRM streams."""
+    import hubspot_handler as hh
+
+    handler = _handler()
+    handler.mapping_for_flow = {"contacts/contacts": {"email": "email"}}
+    handler.stream_name_mapping = {"contacts": "contacts"}
+    handler.flow_id = "AJ3x0LMYI"
+    handler.input_dir = "unused"
+    handler.output_dir = "unused"
+    handler.list_available_streams = lambda: ["contacts", "form_submissions", "forms"]
+    handler._prepare_owner_lookup = lambda streams: None
+    handler._prepare_list_lookup = lambda streams: None
+    handler._prepare_account_lookup = lambda: None
+    handler._apply_read_mapping = lambda df, stream: (df, None)
+    handler._resolve_contact_account_ids = lambda df, lookup: df
+    handler._merge_owner_details = lambda df, lookup, owner_column: df
+    handler._populate_list_memberships = lambda df, stream, lookup: df
+
+    chunks = {
+        "forms": pd.DataFrame([FORM_RECORD]),
+        "form_submissions": pd.DataFrame([FORM_SUBMISSION_RECORD]),
+        "contacts": pd.DataFrame([{"id": "1", "email": "a@b.com"}]),
+    }
+    written = []
+    orig_iter, orig_append = hh.iter_stream_chunks, hh.append_singer_records
+    hh.iter_stream_chunks = lambda input_dir, stream: iter([chunks[stream]])
+    hh.append_singer_records = (
+        lambda df, stream, output_dir, first: written.append((stream, len(df)))
+    )
+    try:
+        handler.handle_read()
+    finally:
+        hh.iter_stream_chunks, hh.append_singer_records = orig_iter, orig_append
+
+    assert [s for s, _ in written] == ["contacts", "forms", "form_submissions"]
+    assert all(count == 1 for _, count in written)
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:
