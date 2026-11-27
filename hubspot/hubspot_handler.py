@@ -93,6 +93,15 @@ class HubSpotHandler(BaseETLHandler):
 
     FORM_STREAMS: Set[str] = {"forms", "form_submissions"}
 
+    # The read path never applies field values from the tenant mapping (the backend's
+    # TenantEnrichmentMapping does), only its stream names. So a tenant onboarded
+    # without a hotglue_mapping entry would otherwise get green jobs that send nothing.
+    CRM_SYNC_FLOW_IDS: Set[str] = {"AJ3x0LMYI"}
+    DEFAULT_READ_STREAM_NAME_MAPPING: Dict[str, str] = {
+        "accounts": "companies",
+        "contacts": "contacts",
+    }
+
     # Streams whose _hg_list_memberships column is resolved into crmListMembershipDetails.
     # Deals get the same treatment as contacts/companies: Deal extends BaseTargetEntity,
     # which already carries crmListMembershipDetails, so leaving it out here would mean the
@@ -504,27 +513,38 @@ class HubSpotHandler(BaseETLHandler):
         if not data_streams:
             logger.warning("No streams available for read operation")
             return
-        # Form and association streams pass through without field mapping; only CRM
-        # streams need a tenant mapping entry for this flow. Flows that carry solely
-        # pass-through streams (e.g. the forms flow) have no mapping at all.
+        # Form and association streams pass through without field mapping. CRM streams
+        # need a stream-name mapping: the tenant's, or the default for the CRM sync flow.
+        # Flows that carry solely pass-through streams (e.g. the forms flow) get neither.
+        stream_name_mapping = self.stream_name_mapping
+        crm_streams_enabled = bool(self.mapping_for_flow)
         if not self.mapping_for_flow:
-            logger.warning(
-                "No mapping for flow %s — only pass-through streams will be processed",
-                self.flow_id,
-            )
+            if self.flow_id in self.CRM_SYNC_FLOW_IDS:
+                stream_name_mapping = dict(self.DEFAULT_READ_STREAM_NAME_MAPPING)
+                crm_streams_enabled = True
+                logger.warning(
+                    "No tenant mapping for CRM sync flow %s — using default read streams %s",
+                    self.flow_id,
+                    stream_name_mapping,
+                )
+            else:
+                logger.warning(
+                    "No mapping for flow %s — only pass-through streams will be processed",
+                    self.flow_id,
+                )
 
         # Build small lookup tables once — these stay in memory throughout (< 1 MB each)
         owner_lookup = self._prepare_owner_lookup(data_streams)
         list_lookup = self._prepare_list_lookup(data_streams)
         account_lookup = self._prepare_account_lookup()
 
-        inverse_mapping = {v: k for k, v in self.stream_name_mapping.items()}
+        inverse_mapping = {v: k for k, v in stream_name_mapping.items()}
         target_streams = [s for s in self.READ_STREAM_ORDER if s in data_streams]
         logger.info("HubSpot read order: %s", target_streams)
 
         for stream in target_streams:
             if (
-                not self.mapping_for_flow
+                not crm_streams_enabled
                 and stream not in self.FORM_STREAMS
                 and stream not in self.ASSOCIATION_STREAMS
             ):

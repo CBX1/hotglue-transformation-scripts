@@ -43,7 +43,7 @@ The system supports two job types:
 
 ### How a job executes (mental model)
 
-1. `etl.py` loads `snapshots/tenant-config.json` → `hotglue_mapping.mapping.{FLOW}` and derives `stream_name_mapping` from its `target/connector` keys (e.g. `"contacts/Contact"` for a Salesforce write, `"contacts/contacts"` for a HubSpot read). **A stream absent from the mapping is not written** — that's the write-policy opt-in signal.
+1. `etl.py` loads `snapshots/tenant-config.json` → `hotglue_mapping.mapping.{FLOW}` and derives `stream_name_mapping` from its `target/connector` keys (e.g. `"contacts/Contact"` for a Salesforce write, `"contacts/contacts"` for a HubSpot read). **A stream absent from the mapping is not written** — that's the write-policy opt-in signal. On a HubSpot **read** for the CRM sync flow (`AJ3x0LMYI`), a tenant with no mapping falls back to `accounts/companies` + `contacts/contacts` (`HubSpotHandler.DEFAULT_READ_STREAM_NAME_MAPPING`); the read path uses only the stream names, since field mapping happens in the backend.
 2. The connector handler (`{connector}_handler.py`, subclass of `base_handler.py`) implements `handle_write()` / `handle_read()`.
 3. Write path: `gs.Reader(sync-output)` → `map_stream_data()` (field mapping) → `drop_sent_records()` (dedupe vs `snapshots/{stream}_{FLOW}.snapshot.csv`) → connector-specific logic (e.g. `split_contacts_by_account()` for SF Contact/Lead) → `write_to_singer()` → `etl-output/data.singer`.
 4. Read path: CRM parquet → field normalization → inject `crmSystem`, rename `remote_id`→`crmAssociationId`, set `lookupKey` → Singer output for `cbx1-target-hotglue`.
