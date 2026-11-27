@@ -411,7 +411,7 @@ def test_handle_read_with_crm_mapping_also_processes_form_streams():
     finally:
         hh.iter_stream_chunks, hh.append_singer_records = orig_iter, orig_append
 
-    assert sorted(s for s, _ in written) == ["contacts", "form_submissions", "forms"]
+    assert [s for s, _ in written] == ["contacts", "forms", "form_submissions"]
     assert all(count == 1 for _, count in written)
 
 
